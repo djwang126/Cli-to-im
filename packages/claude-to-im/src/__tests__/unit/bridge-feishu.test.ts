@@ -11,7 +11,7 @@ import {
   resolveFeishuDomain,
 } from '../../lib/bridge/adapters/feishu-cardkit';
 import {
-  FEISHU_TOOLS_MARKER,
+  FEISHU_THINKING_MARKER,
   buildFinalCardJson,
   buildPermissionButtonCard,
   buildStreamingContent,
@@ -144,17 +144,13 @@ describe('feishu card helpers', () => {
       { status: '✅ Completed', elapsed: '1.2s' },
       [
         { kind: 'text', content: '第一段正文' },
-        { kind: 'tools', content: FEISHU_TOOLS_MARKER },
         { kind: 'text', content: '第二段正文' },
       ],
     ));
 
     const elements = card.body.elements;
     assert.equal(elements[0].tag, 'markdown');
-    assert.equal(
-      elements[0].content,
-      `第一段正文\n\n${FEISHU_TOOLS_MARKER}\n\n第二段正文`,
-    );
+    assert.equal(elements[0].content, '第一段正文\n\n第二段正文');
     const footer = elements.find((el: any) => el.text_size === 'notation');
     assert.ok(String(footer.content).includes('Completed'));
     assert.ok(String(footer.content).includes('1.2s'));
@@ -163,11 +159,11 @@ describe('feishu card helpers', () => {
   it('uses the same chronological rule for streaming content', () => {
     const content = buildStreamingContent([
       { kind: 'text', content: '第一段正文' },
-      { kind: 'tools', content: FEISHU_TOOLS_MARKER },
+      { kind: 'tools', content: FEISHU_THINKING_MARKER },
       { kind: 'text', content: '第二段正文' },
     ]);
 
-    assert.equal(content, `第一段正文\n\n${FEISHU_TOOLS_MARKER}\n\n第二段正文`);
+    assert.equal(content, `第一段正文\n\n${FEISHU_THINKING_MARKER}\n\n第二段正文`);
   });
 
   it('supports diagnostic callback namespace in permission cards', () => {
@@ -248,7 +244,7 @@ describe('FeishuAdapter streaming card lifecycle', () => {
     adapter.restClient = buildMockRestClient(calls);
   });
 
-  it('uses CardKit v1 create -> content -> settings -> update sequence', async () => {
+  it('uses CardKit v1 create -> content -> settings sequence and skips full refresh when content already matches', async () => {
     const created = await adapter.createStreamingCard('chat-1', 'reply-1');
     assert.equal(created, true);
 
@@ -265,7 +261,6 @@ describe('FeishuAdapter streaming card lifecycle', () => {
         'im.message.reply',
         'cardElement.content',
         'card.settings',
-        'card.update',
       ],
     );
 
@@ -279,17 +274,10 @@ describe('FeishuAdapter streaming card lifecycle', () => {
 
     const settingsPayload = calls[3].payload;
     assert.deepEqual(JSON.parse(settingsPayload.data.settings), { config: { streaming_mode: false } });
-
-    const updatePayload = calls[4].payload;
-    const finalCard = JSON.parse(updatePayload.data.card.data);
-    const elements = finalCard.body.elements;
-    const body = elements.find((el: any) => el.tag === 'markdown' && String(el.content).includes('Hello from stream'));
-    assert.equal(body.content, 'Hello from stream');
-    const footer = finalCard.body.elements.find((el: any) => el.text_size === 'notation');
-    assert.ok(String(footer.content).includes('Completed'));
+    assert.ok(!calls.some((entry) => entry.name === 'card.update'));
   });
 
-  it('collapses a tool phase to a single marker and keeps text blocks split by tool usage', async () => {
+  it('shows a temporary thinking marker during tool phases and removes it once text resumes', async () => {
     const created = await adapter.createStreamingCard('chat-1', 'reply-1');
     assert.equal(created, true);
 
@@ -306,10 +294,30 @@ describe('FeishuAdapter streaming card lifecycle', () => {
     const finalized = await adapter.onStreamEnd('chat-1', 'completed', '第一段\n\n第二段');
     assert.equal(finalized, true);
 
-    const updatePayload = calls.findLast((entry) => entry.name === 'card.update')?.payload;
-    const finalCard = JSON.parse(updatePayload.data.card.data);
-    const body = finalCard.body.elements.find((el: any) => el.tag === 'markdown');
-    assert.equal(body.content, `第一段\n\n${FEISHU_TOOLS_MARKER}\n\n第二段`);
+    const streamingContents = calls
+      .filter((entry) => entry.name === 'cardElement.content')
+      .map((entry) => entry.payload.data.content);
+    assert.ok(streamingContents.some((content) => content === `第一段\n\n${FEISHU_THINKING_MARKER}`));
+    assert.equal(streamingContents[streamingContents.length - 1], '第一段\n\n第二段');
+    assert.ok(!calls.some((entry) => entry.name === 'card.update'));
+  });
+
+  it('does not perform a full-card refresh on completed streams even if a thinking marker was shown', async () => {
+    const created = await adapter.createStreamingCard('chat-1', 'reply-1');
+    assert.equal(created, true);
+
+    adapter.onStreamText('chat-1', '第一段');
+    adapter.onToolEvent('chat-1', [{ id: 'tool-1', name: 'workspace.scan', status: 'running' }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const finalized = await adapter.onStreamEnd('chat-1', 'completed', '第一段');
+    assert.equal(finalized, true);
+
+    const streamingContents = calls
+      .filter((entry) => entry.name === 'cardElement.content')
+      .map((entry) => entry.payload.data.content);
+    assert.ok(streamingContents.includes(`第一段\n\n${FEISHU_THINKING_MARKER}`));
+    assert.ok(!calls.some((entry) => entry.name === 'card.update'));
   });
 
   it('returns false instead of throwing when card creation fails', async () => {

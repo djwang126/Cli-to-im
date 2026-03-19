@@ -13,7 +13,7 @@ import { FEISHU_STREAMING_ELEMENT_ID } from '../adapters/feishu-cardkit.js';
  */
 
 type FeishuCardElement = Record<string, unknown>;
-export const FEISHU_TOOLS_MARKER = 'using tools...';
+export const FEISHU_THINKING_MARKER = '💭 Thinking...';
 export interface FeishuFinalCardEntry {
   kind: 'text' | 'tools';
   content: string;
@@ -116,7 +116,7 @@ export function htmlToFeishuMarkdown(html: string): string {
  * Collapse any active tool snapshot to a single sentence.
  */
 export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
-  return tools.length > 0 ? FEISHU_TOOLS_MARKER : '';
+  return tools.length > 0 ? FEISHU_THINKING_MARKER : '';
 }
 
 export function buildChronologicalMarkdown(entries: FeishuFinalCardEntry[]): string {
@@ -169,7 +169,7 @@ export function buildStreamingContent(
  * Build the initial streaming card JSON.
  * CardKit v1 creates a card entity that still uses schema 2.0 content.
  */
-export function buildStreamingCardJson(initialText = '💭 Thinking...'): string {
+export function buildStreamingCardJson(initialText = FEISHU_THINKING_MARKER): string {
   return buildSchema2Card({
     config: {
       streaming_mode: true,

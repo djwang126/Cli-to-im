@@ -56,7 +56,7 @@
 - `markdown/feishu.ts`
   - 统一 schema 2.0 卡片 builder
   - 提供普通卡、流式初始卡、最终卡、权限卡 builder
-  - 流式和最终卡共用同一套“文本块 + using tools”时间顺序渲染规则
+  - 流式阶段用临时 `💭 Thinking...` 占位，文本恢复后自动移除；最终卡只保留正文顺序与 footer
 - `adapters/feishu-cardkit.ts`
   - 统一 domain 解析
   - 统一 CardKit v1 的 create/settings/update payload 形状

@@ -18,7 +18,7 @@ import {
   buildPermissionButtonCard,
   buildStreamingContent,
   buildStreamingCardJson,
-  FEISHU_TOOLS_MARKER,
+  FEISHU_THINKING_MARKER,
   formatElapsed,
   type FeishuFinalCardEntry,
 } from '../packages/claude-to-im/src/lib/bridge/markdown/feishu.ts';
@@ -55,7 +55,7 @@ function appendTextEntry(entries: FeishuFinalCardEntry[], delta: string): void {
 function appendToolsEntry(entries: FeishuFinalCardEntry[]): void {
   const last = entries[entries.length - 1];
   if (last?.kind === 'tools') return;
-  entries.push({ kind: 'tools', content: FEISHU_TOOLS_MARKER });
+  entries.push({ kind: 'tools', content: FEISHU_THINKING_MARKER });
 }
 
 function appendRenderedText(entries: FeishuFinalCardEntry[], previous: string, current: string): string {
@@ -75,6 +75,40 @@ function hasToolPhaseChange(previousTools: ToolCallInfo[], nextTools: ToolCallIn
     if (previousStatuses.get(tool.id) !== tool.status) return true;
   }
   return false;
+}
+
+function cloneTranscript(entries: FeishuFinalCardEntry[]): FeishuFinalCardEntry[] {
+  return entries.map((entry) => ({ ...entry }));
+}
+
+function buildCommittedTranscript(
+  transcript: FeishuFinalCardEntry[],
+  previousText: string,
+  renderedText: string,
+  toolPhasePending: boolean,
+  toolPhaseTextCheckpoint: string,
+): FeishuFinalCardEntry[] {
+  const next = cloneTranscript(transcript);
+  if (!toolPhasePending) {
+    appendRenderedText(next, previousText, renderedText);
+    return next;
+  }
+
+  appendRenderedText(next, previousText, toolPhaseTextCheckpoint);
+  if (renderedText !== toolPhaseTextCheckpoint) {
+    appendRenderedText(next, toolPhaseTextCheckpoint, renderedText);
+  }
+  return next;
+}
+
+function buildPreviewTranscript(
+  committedTranscript: FeishuFinalCardEntry[],
+  toolPhaseWaitingForText: boolean,
+): FeishuFinalCardEntry[] {
+  if (!toolPhaseWaitingForText) return committedTranscript;
+  const preview = cloneTranscript(committedTranscript);
+  appendToolsEntry(preview);
+  return preview;
 }
 
 function parseArgs(argv: string[]): { mode: Mode; chatId?: string } {
@@ -215,12 +249,25 @@ async function sendStreamingCard(client: lark.Client, chatId: string): Promise<v
   const transcript: FeishuFinalCardEntry[] = [];
   let renderedText = '';
   let lastTools: ToolCallInfo[] = [];
+  let toolPhasePending = false;
+  let toolPhaseTextCheckpoint = '';
 
   for (let i = 0; i < texts.length; i++) {
-    renderedText = appendRenderedText(transcript, renderedText, texts.slice(0, i + 1).join('\n\n'));
     if (toolSets[i].length > 0 && hasToolPhaseChange(lastTools, toolSets[i])) {
-      appendToolsEntry(transcript);
+      toolPhasePending = true;
+      toolPhaseTextCheckpoint = renderedText;
     }
+    const nextRenderedText = texts.slice(0, i + 1).join('\n\n');
+    const committedTranscript = buildCommittedTranscript(
+      transcript,
+      renderedText,
+      nextRenderedText,
+      toolPhasePending,
+      toolPhaseTextCheckpoint,
+    );
+    const toolPhaseWaitingForText = toolPhasePending && nextRenderedText === toolPhaseTextCheckpoint;
+    const previewTranscript = buildPreviewTranscript(committedTranscript, toolPhaseWaitingForText);
+    renderedText = nextRenderedText;
     lastTools = toolSets[i].map((tool) => ({ ...tool }));
     sequence++;
     await client.cardkit.v1.cardElement.content({
@@ -229,10 +276,15 @@ async function sendStreamingCard(client: lark.Client, chatId: string): Promise<v
         element_id: FEISHU_STREAMING_ELEMENT_ID,
       },
       data: {
-        content: buildStreamingContent(transcript, renderedText, lastTools),
+        content: buildStreamingContent(previewTranscript, renderedText, lastTools),
         sequence,
       },
     });
+    transcript.splice(0, transcript.length, ...committedTranscript);
+    if (!toolPhaseWaitingForText) {
+      toolPhasePending = false;
+      toolPhaseTextCheckpoint = '';
+    }
     console.log('[feishu:card:test] streaming update ok:', { cardId, sequence });
     await sleep(700);
   }
@@ -246,6 +298,11 @@ async function sendStreamingCard(client: lark.Client, chatId: string): Promise<v
     }, sequence),
   });
   console.log('[feishu:card:test] streaming mode closed:', { cardId, sequence });
+
+  if (!toolPhasePending) {
+    console.log('[feishu:card:test] final card refresh skipped:', { cardId, reason: 'content already matches final stream' });
+    return;
+  }
 
   sequence++;
   const finalCardJson = buildFinalCardJson(

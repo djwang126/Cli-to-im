@@ -37,7 +37,7 @@ import {
   buildStreamingCardJson,
   buildFinalCardJson,
   buildPermissionButtonCard,
-  FEISHU_TOOLS_MARKER,
+  FEISHU_THINKING_MARKER,
   formatElapsed,
   type FeishuFinalCardEntry,
 } from '../markdown/feishu.js';
@@ -79,7 +79,7 @@ interface FeishuCardState {
 }
 
 /** Streaming card throttle interval (ms). */
-const CARD_THROTTLE_MS = 200;
+const CARD_THROTTLE_MS = 120;
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -435,7 +435,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private appendToolsEntry(entries: FeishuFinalCardEntry[]): void {
     const last = entries[entries.length - 1];
     if (last?.kind === 'tools') return;
-    entries.push({ kind: 'tools', content: FEISHU_TOOLS_MARKER });
+    entries.push({ kind: 'tools', content: FEISHU_THINKING_MARKER });
   }
 
   private appendRenderedText(entries: FeishuFinalCardEntry[], previousText: string | null, renderedText: string): void {
@@ -449,24 +449,32 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.appendTextEntry(entries, delta);
   }
 
-  private buildPreviewTranscript(
+  private buildCommittedTranscript(
     state: FeishuCardState,
     renderedText: string,
-    includeToolPhase: boolean,
   ): FeishuFinalCardEntry[] {
     const next = this.cloneTranscript(state.transcript);
-    if (!includeToolPhase) {
+    if (!state.toolPhasePending) {
       this.appendRenderedText(next, state.lastRenderedText, renderedText);
       return next;
     }
 
     const checkpoint = state.toolPhaseTextCheckpoint ?? state.lastRenderedText ?? '';
     this.appendRenderedText(next, state.lastRenderedText, checkpoint);
-    if (includeToolPhase) {
-      this.appendToolsEntry(next);
+    if (renderedText !== checkpoint) {
+      this.appendRenderedText(next, checkpoint, renderedText);
     }
-    this.appendRenderedText(next, checkpoint, renderedText);
     return next;
+  }
+
+  private buildPreviewTranscript(
+    committedTranscript: FeishuFinalCardEntry[],
+    toolPhaseWaitingForText: boolean,
+  ): FeishuFinalCardEntry[] {
+    if (!toolPhaseWaitingForText) return committedTranscript;
+    const preview = this.cloneTranscript(committedTranscript);
+    this.appendToolsEntry(preview);
+    return preview;
   }
 
   private hasToolPhaseChange(previousTools: ToolCallInfo[], nextTools: ToolCallInfo[]): boolean {
@@ -614,8 +622,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
     state.pendingText = text;
 
+    const toolPhaseWaitingForText = state.toolPhasePending
+      && text === (state.toolPhaseTextCheckpoint ?? state.lastRenderedText ?? '');
+    const toolPhaseResumed = state.toolPhasePending && !toolPhaseWaitingForText;
+
     const elapsed = Date.now() - state.lastUpdateAt;
-    if (elapsed < CARD_THROTTLE_MS && state.lastUpdateAt > 0) {
+    if (!toolPhaseWaitingForText && !toolPhaseResumed && elapsed < CARD_THROTTLE_MS && state.lastUpdateAt > 0) {
       // Schedule trailing-edge flush
       if (!state.throttleTimer) {
         state.throttleTimer = setTimeout(() => {
@@ -643,9 +655,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (!state || !this.restClient || !cardkit) return null;
 
     const renderedText = state.pendingText || '';
-    const includeToolPhase = state.toolPhasePending;
-    const nextTranscript = this.buildPreviewTranscript(state, renderedText, includeToolPhase);
-    const content = buildStreamingContent(nextTranscript, renderedText, state.toolCalls);
+    const checkpoint = state.toolPhaseTextCheckpoint ?? state.lastRenderedText ?? '';
+    const toolPhaseWaitingForText = state.toolPhasePending && renderedText === checkpoint;
+    const committedTranscript = this.buildCommittedTranscript(state, renderedText);
+    const previewTranscript = this.buildPreviewTranscript(committedTranscript, toolPhaseWaitingForText);
+    const content = buildStreamingContent(previewTranscript, renderedText, state.toolCalls);
 
     state.sequence++;
     const seq = state.sequence;
@@ -664,8 +678,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
           path: { card_id: cardId, element_id: FEISHU_STREAMING_ELEMENT_ID },
           data: { content, sequence: seq },
         });
-        state.transcript = nextTranscript;
-        if (includeToolPhase) {
+        state.transcript = committedTranscript;
+        if (!toolPhaseWaitingForText) {
           state.toolPhasePending = false;
           state.toolPhaseTextCheckpoint = null;
         }
@@ -748,6 +762,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const finalText = state.lastRenderedText || state.finalText || state.pendingText || '';
     this.ensureTextCaptured(state, finalText);
+    const needsFinalCardRefresh = status !== 'completed' || state.toolPhasePending;
+    state.toolPhasePending = false;
+    state.toolPhaseTextCheckpoint = null;
 
     try {
       // Step 1: Close streaming mode
@@ -769,6 +786,12 @@ export class FeishuAdapter extends BaseChannelAdapter {
       });
       this.activeCards.delete(chatId);
       return false;
+    }
+
+    if (!needsFinalCardRefresh) {
+      console.log(`[feishu-adapter] Card finalized without full-card refresh: cardId=${state.cardId}, status=${status}`);
+      this.activeCards.delete(chatId);
+      return true;
     }
 
     try {
