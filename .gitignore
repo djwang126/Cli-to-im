@@ -1,0 +1,9 @@
+node_modules/
+dist/
+coverage/
+*.log
+*.pid
+.DS_Store
+Thumbs.db
+config.env
+*.local

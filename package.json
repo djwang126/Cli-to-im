@@ -1,0 +1,31 @@
+{
+  "name": "claude-to-im-skill",
+  "version": "0.1.0",
+  "description": "Claude Code Skill: Bridge IM platforms (Telegram, Discord, Feishu, QQ) to Claude Code sessions",
+  "type": "module",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "typecheck": "tsc --noEmit",
+    "dev": "tsx src/main.ts",
+    "test": "node scripts/run-tests.mjs",
+    "bridge:build": "npm --prefix packages/claude-to-im run build",
+    "bridge:typecheck": "npm --prefix packages/claude-to-im run typecheck",
+    "bridge:test": "npm --prefix packages/claude-to-im test"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.62",
+    "claude-to-im": "file:packages/claude-to-im"
+  },
+  "optionalDependencies": {
+    "@openai/codex-sdk": "^0.110.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22",
+    "esbuild": "^0.25.0",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
