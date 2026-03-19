@@ -34,10 +34,21 @@ import {
   buildCardContent,
   buildPostContent,
   buildStreamingContent,
+  buildStreamingCardJson,
   buildFinalCardJson,
   buildPermissionButtonCard,
+  FEISHU_TOOLS_MARKER,
   formatElapsed,
+  type FeishuFinalCardEntry,
 } from '../markdown/feishu.js';
+import {
+  FEISHU_STREAMING_ELEMENT_ID,
+  buildCardCreateData,
+  buildCardReferenceContent,
+  buildCardSettingsData,
+  buildCardUpdateData,
+  resolveFeishuDomain,
+} from './feishu-cardkit.js';
 
 /** Max number of message_ids to keep for dedup. */
 const DEDUP_MAX = 1000;
@@ -48,7 +59,7 @@ const MAX_FILE_SIZE = 20 * 1024 * 1024;
 /** Feishu emoji type for typing indicator (same as Openclaw). */
 const TYPING_EMOJI = 'Typing';
 
-/** State for an active CardKit v2 streaming card. */
+/** State for an active CardKit v1 streaming card entity (schema 2.0 payload). */
 interface FeishuCardState {
   cardId: string;
   messageId: string;
@@ -57,8 +68,14 @@ interface FeishuCardState {
   toolCalls: ToolCallInfo[];
   thinking: boolean;
   pendingText: string | null;
+  finalText: string | null;
+  lastRenderedText: string | null;
+  transcript: FeishuFinalCardEntry[];
+  toolPhasePending: boolean;
+  toolPhaseTextCheckpoint: string | null;
   lastUpdateAt: number;
   throttleTimer: ReturnType<typeof setTimeout> | null;
+  inFlightUpdate: Promise<void> | null;
 }
 
 /** Streaming card throttle interval (ms). */
@@ -108,6 +125,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private waiters: Array<(msg: InboundMessage | null) => void> = [];
   private wsClient: lark.WSClient | null = null;
   private restClient: lark.Client | null = null;
+  private baseUrl = 'https://open.feishu.cn';
   private seenMessageIds = new Map<string, boolean>();
   private botOpenId: string | null = null;
   /** All known bot IDs (open_id, user_id, union_id) for mention matching. */
@@ -135,19 +153,18 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const appId = getBridgeContext().store.getSetting('bridge_feishu_app_id') || '';
     const appSecret = getBridgeContext().store.getSetting('bridge_feishu_app_secret') || '';
     const domainSetting = getBridgeContext().store.getSetting('bridge_feishu_domain') || 'feishu';
-    const domain = domainSetting === 'lark'
-      ? lark.Domain.Lark
-      : lark.Domain.Feishu;
+    const domainInfo = resolveFeishuDomain(domainSetting);
+    this.baseUrl = domainInfo.baseUrl;
 
     // Create REST client
     this.restClient = new lark.Client({
       appId,
       appSecret,
-      domain,
+      domain: domainInfo.sdkDomain,
     });
 
     // Resolve bot identity for @mention detection
-    await this.resolveBotIdentity(appId, appSecret, domain);
+    await this.resolveBotIdentity(appId, appSecret);
 
     this.running = true;
 
@@ -165,7 +182,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.wsClient = new lark.WSClient({
       appId,
       appSecret,
-      domain,
+      domain: domainInfo.sdkDomain,
     });
 
     // Monkey-patch WSClient.handleEventData to support card action events (type: "card").
@@ -330,6 +347,23 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
       if (!chatId) return FALLBACK_TOAST;
 
+      if (callbackData.startsWith('diag:')) {
+        console.log('[feishu-adapter] Diagnostic card action:', callbackData, 'chatId:', chatId, 'messageId:', messageId || 'unknown');
+        try {
+          getBridgeContext().store.insertAuditLog({
+            channelType: 'feishu',
+            chatId,
+            direction: 'inbound',
+            messageId: messageId || `diag_${Date.now()}`,
+            summary: `[DIAG] ${callbackData}`,
+          });
+        } catch {
+          // Best effort audit only.
+        }
+        const action = callbackData.split(':')[1] || 'tap';
+        return { toast: { type: 'info' as const, content: `诊断按钮已收到：${action}` } };
+      }
+
       const callbackMsg: import('../types.js').InboundMessage = {
         messageId: messageId || `card_action_${Date.now()}`,
         address: {
@@ -351,14 +385,120 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
   }
 
-  // ── Streaming Card (CardKit v2) ────────────────────────────────
+  private getCardkitV1(): any | null {
+    const cardkit = (this.restClient as any)?.cardkit?.v1;
+    if (!cardkit) {
+      console.warn('[feishu-adapter] CardKit v1 API unavailable in current SDK');
+      return null;
+    }
+    return cardkit;
+  }
+
+  private formatError(err: unknown): string {
+    return err instanceof Error ? err.message : String(err);
+  }
+
+  private logCardStage(
+    level: 'log' | 'warn',
+    stage: 'create-card' | 'send-card-message' | 'stream-content' | 'close-stream' | 'final-update',
+    message: string,
+    context?: Record<string, unknown>,
+  ): void {
+    const extra = context ? ` ${JSON.stringify(context)}` : '';
+    const line = `[feishu-adapter] ${stage}: ${message}${extra}`;
+    if (level === 'warn') {
+      console.warn(line);
+      return;
+    }
+    console.log(line);
+  }
+
+  private cloneTranscript(entries: FeishuFinalCardEntry[]): FeishuFinalCardEntry[] {
+    return entries.map((entry) => ({ ...entry }));
+  }
+
+  private appendTextEntry(entries: FeishuFinalCardEntry[], delta: string): void {
+    if (!delta) return;
+
+    const last = entries[entries.length - 1];
+    if (last?.kind === 'text') {
+      last.content += delta;
+      return;
+    }
+
+    const normalized = entries.length > 0 ? delta.replace(/^\n+/, '') : delta;
+    if (!normalized) return;
+    if (!normalized.trim() && entries.length > 0) return;
+    entries.push({ kind: 'text', content: normalized });
+  }
+
+  private appendToolsEntry(entries: FeishuFinalCardEntry[]): void {
+    const last = entries[entries.length - 1];
+    if (last?.kind === 'tools') return;
+    entries.push({ kind: 'tools', content: FEISHU_TOOLS_MARKER });
+  }
+
+  private appendRenderedText(entries: FeishuFinalCardEntry[], previousText: string | null, renderedText: string): void {
+    const previous = previousText || '';
+    let delta = renderedText;
+    if (previous && renderedText.startsWith(previous)) {
+      delta = renderedText.slice(previous.length);
+    } else if (previous === renderedText) {
+      delta = '';
+    }
+    this.appendTextEntry(entries, delta);
+  }
+
+  private buildPreviewTranscript(
+    state: FeishuCardState,
+    renderedText: string,
+    includeToolPhase: boolean,
+  ): FeishuFinalCardEntry[] {
+    const next = this.cloneTranscript(state.transcript);
+    if (!includeToolPhase) {
+      this.appendRenderedText(next, state.lastRenderedText, renderedText);
+      return next;
+    }
+
+    const checkpoint = state.toolPhaseTextCheckpoint ?? state.lastRenderedText ?? '';
+    this.appendRenderedText(next, state.lastRenderedText, checkpoint);
+    if (includeToolPhase) {
+      this.appendToolsEntry(next);
+    }
+    this.appendRenderedText(next, checkpoint, renderedText);
+    return next;
+  }
+
+  private hasToolPhaseChange(previousTools: ToolCallInfo[], nextTools: ToolCallInfo[]): boolean {
+    const previousStatuses = new Map(previousTools.map((tool) => [tool.id, tool.status]));
+    for (const tool of nextTools) {
+      if (previousStatuses.get(tool.id) !== tool.status) return true;
+    }
+    return false;
+  }
+
+  private ensureTextCaptured(state: FeishuCardState, renderedText: string): void {
+    const hasTextEntry = state.transcript.some((entry) => entry.kind === 'text');
+    if (hasTextEntry || !renderedText.trim()) return;
+    this.appendTextEntry(state.transcript, renderedText);
+  }
+
+  private beginToolPhase(state: FeishuCardState): void {
+    if (state.toolPhasePending) return;
+    const last = state.transcript[state.transcript.length - 1];
+    if (last?.kind === 'tools') return;
+    state.toolPhasePending = true;
+    state.toolPhaseTextCheckpoint = state.pendingText ?? state.lastRenderedText ?? '';
+  }
+
+  // ── Streaming Card (CardKit v1 + schema 2.0) ───────────────────
 
   /**
    * Create a new streaming card and send it as a message.
    * Returns true if card was created successfully.
    */
   private createStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
-    if (!this.restClient || this.activeCards.has(chatId)) return Promise.resolve(false);
+    if (!this.restClient || !this.getCardkitV1() || this.activeCards.has(chatId)) return Promise.resolve(false);
 
     // In-flight guard: if creation is already in progress, return the existing promise
     const existing = this.cardCreatePromises.get(chatId);
@@ -372,45 +512,42 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
   private async _doCreateStreamingCard(chatId: string, replyToMessageId?: string): Promise<boolean> {
     if (!this.restClient) return false;
+    const cardkit = this.getCardkitV1();
+    if (!cardkit) return false;
 
     try {
-      // Step 1: Create card via CardKit v2
-      const cardBody = {
-        schema: '2.0',
-        config: {
-          streaming_mode: true,
-          wide_screen_mode: true,
-          summary: { content: '思考中...' },
-        },
-        body: {
-          elements: [{
-            tag: 'markdown',
-            content: '💭 Thinking...',
-            text_align: 'left',
-            text_size: 'normal',
-            element_id: 'streaming_content',
-          }],
-        },
-      };
-
-      const createResp = await (this.restClient as any).cardkit.v2.card.create({
-        data: { type: 'card_json', data: JSON.stringify(cardBody) },
+      this.logCardStage('log', 'create-card', 'creating streaming card entity', {
+        chatId,
+        replyToMessageId: replyToMessageId || null,
+      });
+      const createResp = await cardkit.card.create({
+        data: buildCardCreateData(buildStreamingCardJson()),
       });
       const cardId = createResp?.data?.card_id;
       if (!cardId) {
-        console.warn('[feishu-adapter] Card create returned no card_id');
+        this.logCardStage('warn', 'create-card', 'card entity created without card_id', { chatId });
         return false;
       }
+      this.logCardStage('log', 'create-card', 'streaming card entity created', { chatId, cardId });
 
       // Step 2: Send card as IM message
-      const cardContent = JSON.stringify({ type: 'card', data: { card_id: cardId } });
+      const cardContent = buildCardReferenceContent(cardId);
       let msgResp;
       if (replyToMessageId) {
+        this.logCardStage('log', 'send-card-message', 'replying with streaming card entity', {
+          chatId,
+          cardId,
+          replyToMessageId,
+        });
         msgResp = await this.restClient.im.message.reply({
           path: { message_id: replyToMessageId },
           data: { content: cardContent, msg_type: 'interactive' },
         });
       } else {
+        this.logCardStage('log', 'send-card-message', 'sending streaming card entity', {
+          chatId,
+          cardId,
+        });
         msgResp = await this.restClient.im.message.create({
           params: { receive_id_type: 'chat_id' },
           data: {
@@ -423,12 +560,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
       const messageId = msgResp?.data?.message_id;
       if (!messageId) {
-        console.warn('[feishu-adapter] Card message send returned no message_id');
+        this.logCardStage('warn', 'send-card-message', 'card entity sent without message_id', {
+          chatId,
+          cardId,
+        });
         return false;
       }
 
       // Store card state
-      this.activeCards.set(chatId, {
+      const state: FeishuCardState = {
         cardId,
         messageId,
         sequence: 0,
@@ -436,14 +576,27 @@ export class FeishuAdapter extends BaseChannelAdapter {
         toolCalls: [],
         thinking: true,
         pendingText: null,
+        finalText: null,
+        lastRenderedText: null,
+        transcript: [],
+        toolPhasePending: false,
+        toolPhaseTextCheckpoint: null,
         lastUpdateAt: 0,
         throttleTimer: null,
-      });
+        inFlightUpdate: null,
+      };
+      this.activeCards.set(chatId, state);
 
-      console.log(`[feishu-adapter] Streaming card created: cardId=${cardId}, msgId=${messageId}`);
+      this.logCardStage('log', 'send-card-message', 'streaming card ready', {
+        chatId,
+        cardId,
+        messageId,
+      });
       return true;
     } catch (err) {
-      console.warn('[feishu-adapter] Failed to create streaming card:', err instanceof Error ? err.message : err);
+      this.logCardStage('warn', 'create-card', `failed to create streaming card (${this.formatError(err)})`, {
+        chatId,
+      });
       return false;
     }
   }
@@ -484,25 +637,57 @@ export class FeishuAdapter extends BaseChannelAdapter {
   /**
    * Flush pending card update to Feishu API.
    */
-  private flushCardUpdate(chatId: string): void {
+  private flushCardUpdate(chatId: string): Promise<void> | null {
     const state = this.activeCards.get(chatId);
-    if (!state || !this.restClient) return;
+    const cardkit = this.getCardkitV1();
+    if (!state || !this.restClient || !cardkit) return null;
 
-    const content = buildStreamingContent(state.pendingText || '', state.toolCalls);
+    const renderedText = state.pendingText || '';
+    const includeToolPhase = state.toolPhasePending;
+    const nextTranscript = this.buildPreviewTranscript(state, renderedText, includeToolPhase);
+    const content = buildStreamingContent(nextTranscript, renderedText, state.toolCalls);
 
     state.sequence++;
     const seq = state.sequence;
     const cardId = state.cardId;
+    const prior = state.inFlightUpdate ?? Promise.resolve();
+    const promise = prior
+      .catch(() => {})
+      .then(async () => {
+        this.logCardStage('log', 'stream-content', 'updating streaming element', {
+          chatId,
+          cardId,
+          sequence: seq,
+          contentLength: content.length,
+        });
+        await cardkit.cardElement.content({
+          path: { card_id: cardId, element_id: FEISHU_STREAMING_ELEMENT_ID },
+          data: { content, sequence: seq },
+        });
+        state.transcript = nextTranscript;
+        if (includeToolPhase) {
+          state.toolPhasePending = false;
+          state.toolPhaseTextCheckpoint = null;
+        }
+        state.lastRenderedText = renderedText;
+        state.lastUpdateAt = Date.now();
+      })
+      .catch((err: unknown) => {
+        this.logCardStage('warn', 'stream-content', this.formatError(err), {
+          chatId,
+          cardId,
+          sequence: seq,
+        });
+      });
 
-    // Fire-and-forget — streaming updates are non-critical
-    (this.restClient as any).cardkit.v2.card.streamContent({
-      path: { card_id: cardId },
-      data: { content, sequence: seq },
-    }).then(() => {
-      state.lastUpdateAt = Date.now();
-    }).catch((err: unknown) => {
-      console.warn('[feishu-adapter] streamContent failed:', err instanceof Error ? err.message : err);
-    });
+    state.inFlightUpdate = promise;
+    promise.finally(() => {
+      const current = this.activeCards.get(chatId);
+      if (current?.inFlightUpdate === promise) {
+        current.inFlightUpdate = null;
+      }
+    }).catch(() => {});
+    return promise;
   }
 
   /**
@@ -511,7 +696,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private updateToolProgress(chatId: string, tools: ToolCallInfo[]): void {
     const state = this.activeCards.get(chatId);
     if (!state) return;
-    state.toolCalls = tools;
+    if (tools.length > 0 && this.hasToolPhaseChange(state.toolCalls, tools)) {
+      this.beginToolPhase(state);
+    }
+    state.toolCalls = tools.map((tool) => ({ ...tool }));
     // Trigger a content flush with current text + updated tools
     this.updateCardContent(chatId, state.pendingText || '');
   }
@@ -532,6 +720,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return false;
+    const cardkit = this.getCardkitV1();
+    if (!cardkit) {
+      this.activeCards.delete(chatId);
+      return false;
+    }
 
     // Clear any pending throttle timer
     if (state.throttleTimer) {
@@ -539,14 +732,46 @@ export class FeishuAdapter extends BaseChannelAdapter {
       state.throttleTimer = null;
     }
 
+    state.finalText = responseText;
+
+    if (state.pendingText && state.pendingText !== state.lastRenderedText) {
+      this.flushCardUpdate(chatId);
+    }
+
+    if (state.inFlightUpdate) {
+      try {
+        await state.inFlightUpdate;
+      } catch {
+        // Individual stream updates are best effort; final card update can still proceed.
+      }
+    }
+
+    const finalText = state.lastRenderedText || state.finalText || state.pendingText || '';
+    this.ensureTextCaptured(state, finalText);
+
     try {
       // Step 1: Close streaming mode
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.settings.streamingMode.set({
-        path: { card_id: state.cardId },
-        data: { streaming_mode: false, sequence: state.sequence },
+      this.logCardStage('log', 'close-stream', 'closing streaming mode', {
+        chatId,
+        cardId: state.cardId,
+        sequence: state.sequence,
       });
+      await cardkit.card.settings({
+        path: { card_id: state.cardId },
+        data: buildCardSettingsData({ streaming_mode: false }, state.sequence),
+      });
+    } catch (err) {
+      this.logCardStage('warn', 'close-stream', this.formatError(err), {
+        chatId,
+        cardId: state.cardId,
+        sequence: state.sequence,
+      });
+      this.activeCards.delete(chatId);
+      return false;
+    }
 
+    try {
       // Step 2: Build and apply final card
       const statusLabels: Record<string, string> = {
         completed: '✅ Completed',
@@ -559,18 +784,29 @@ export class FeishuAdapter extends BaseChannelAdapter {
         elapsed: formatElapsed(elapsedMs),
       };
 
-      const finalCardJson = buildFinalCardJson(responseText, state.toolCalls, footer);
+      const finalCardJson = buildFinalCardJson(finalText, state.toolCalls, footer, state.transcript);
 
       state.sequence++;
-      await (this.restClient as any).cardkit.v2.card.update({
+      this.logCardStage('log', 'final-update', 'updating final card payload', {
+        chatId,
+        cardId: state.cardId,
+        sequence: state.sequence,
+        status,
+      });
+      await cardkit.card.update({
         path: { card_id: state.cardId },
-        data: { type: 'card_json', data: finalCardJson, sequence: state.sequence },
+        data: buildCardUpdateData(finalCardJson, state.sequence),
       });
 
       console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
       return true;
     } catch (err) {
-      console.warn('[feishu-adapter] Card finalize failed:', err instanceof Error ? err.message : err);
+      this.logCardStage('warn', 'final-update', this.formatError(err), {
+        chatId,
+        cardId: state.cardId,
+        sequence: state.sequence,
+        status,
+      });
       return false;
     } finally {
       this.activeCards.delete(chatId);
@@ -1180,14 +1416,9 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private async resolveBotIdentity(
     appId: string,
     appSecret: string,
-    domain: lark.Domain,
   ): Promise<void> {
     try {
-      const baseUrl = domain === lark.Domain.Lark
-        ? 'https://open.larksuite.com'
-        : 'https://open.feishu.cn';
-
-      const tokenRes = await fetch(`${baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, {
+      const tokenRes = await fetch(`${this.baseUrl}/open-apis/auth/v3/tenant_access_token/internal`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
@@ -1199,7 +1430,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
         return;
       }
 
-      const botRes = await fetch(`${baseUrl}/open-apis/bot/v3/info/`, {
+      const botRes = await fetch(`${this.baseUrl}/open-apis/bot/v3/info/`, {
         method: 'GET',
         headers: { Authorization: `Bearer ${tokenData.tenant_access_token}` },
         signal: AbortSignal.timeout(10_000),

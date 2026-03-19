@@ -1,4 +1,5 @@
 import type { ToolCallInfo } from '../types.js';
+import { FEISHU_STREAMING_ELEMENT_ID } from '../adapters/feishu-cardkit.js';
 
 /**
  * Feishu-specific Markdown processing.
@@ -10,6 +11,31 @@ import type { ToolCallInfo } from '../types.js';
  * Schema 2.0 cards render code blocks, tables, bold, italic, links properly.
  * Post messages with md tag render bold, italic, inline code, links.
  */
+
+type FeishuCardElement = Record<string, unknown>;
+export const FEISHU_TOOLS_MARKER = 'using tools...';
+export interface FeishuFinalCardEntry {
+  kind: 'text' | 'tools';
+  content: string;
+}
+
+function buildSchema2Card(params: {
+  header?: Record<string, unknown>;
+  config?: Record<string, unknown>;
+  elements: FeishuCardElement[];
+}): string {
+  const payload: Record<string, unknown> = {
+    schema: '2.0',
+    body: {
+      elements: params.elements,
+    },
+  };
+
+  if (params.header) payload.header = params.header;
+  if (params.config) payload.config = params.config;
+
+  return JSON.stringify(payload);
+}
 
 /**
  * Detect complex markdown (code blocks / tables).
@@ -39,19 +65,14 @@ export function preprocessFeishuMarkdown(text: string): string {
  * Aligned with Openclaw's buildMarkdownCard().
  */
 export function buildCardContent(text: string): string {
-  return JSON.stringify({
-    schema: '2.0',
+  return buildSchema2Card({
     config: {
       wide_screen_mode: true,
     },
-    body: {
-      elements: [
-        {
-          tag: 'markdown',
-          content: text,
-        },
-      ],
-    },
+    elements: [{
+      tag: 'markdown',
+      content: text,
+    }],
   });
 }
 
@@ -92,16 +113,24 @@ export function htmlToFeishuMarkdown(html: string): string {
 }
 
 /**
- * Build tool progress markdown lines.
- * Each tool shows an icon based on status: 🔄 Running, ✅ Complete, ❌ Error.
+ * Collapse any active tool snapshot to a single sentence.
  */
 export function buildToolProgressMarkdown(tools: ToolCallInfo[]): string {
-  if (tools.length === 0) return '';
-  const lines = tools.map((tc) => {
-    const icon = tc.status === 'running' ? '🔄' : tc.status === 'complete' ? '✅' : '❌';
-    return `${icon} \`${tc.name}\``;
-  });
-  return lines.join('\n');
+  return tools.length > 0 ? FEISHU_TOOLS_MARKER : '';
+}
+
+export function buildChronologicalMarkdown(entries: FeishuFinalCardEntry[]): string {
+  const parts = entries
+    .map((entry) => ({
+      kind: entry.kind,
+      content: entry.kind === 'text'
+        ? preprocessFeishuMarkdown(entry.content)
+        : entry.content.trim(),
+    }))
+    .filter((entry) => entry.kind === 'text' ? entry.content.length > 0 : entry.content.length > 0);
+
+  if (parts.length === 0) return '';
+  return parts.map((entry) => entry.content).join('\n\n');
 }
 
 /**
@@ -117,16 +146,49 @@ export function formatElapsed(ms: number): string {
 }
 
 /**
- * Build the body elements array for a streaming card update.
- * Combines main text content with tool progress.
+ * Build the body content for a streaming card update using the same rule as the final card.
  */
-export function buildStreamingContent(text: string, tools: ToolCallInfo[]): string {
-  let content = text || '';
+export function buildStreamingContent(
+  entries: FeishuFinalCardEntry[],
+  fallbackText = '',
+  tools: ToolCallInfo[] = [],
+): string {
+  const content = buildChronologicalMarkdown(entries);
+  if (content) return content;
+
+  const text = preprocessFeishuMarkdown(fallbackText);
+  if (text) return text;
+
   const toolMd = buildToolProgressMarkdown(tools);
-  if (toolMd) {
-    content = content ? `${content}\n\n${toolMd}` : toolMd;
-  }
-  return content || '💭 Thinking...';
+  if (toolMd) return toolMd;
+
+  return ' ';
+}
+
+/**
+ * Build the initial streaming card JSON.
+ * CardKit v1 creates a card entity that still uses schema 2.0 content.
+ */
+export function buildStreamingCardJson(initialText = '💭 Thinking...'): string {
+  return buildSchema2Card({
+    config: {
+      streaming_mode: true,
+      wide_screen_mode: true,
+      summary: { content: '生成中...' },
+      streaming_config: {
+        print_frequency_ms: { default: 70, android: 70, ios: 70, pc: 70 },
+        print_step: { default: 1, android: 1, ios: 1, pc: 1 },
+        print_strategy: 'fast',
+      },
+    },
+    elements: [{
+      tag: 'markdown',
+      content: initialText,
+      text_align: 'left',
+      text_size: 'normal',
+      element_id: FEISHU_STREAMING_ELEMENT_ID,
+    }],
+  });
 }
 
 /**
@@ -136,14 +198,17 @@ export function buildFinalCardJson(
   text: string,
   tools: ToolCallInfo[],
   footer: { status: string; elapsed: string } | null,
+  entries: FeishuFinalCardEntry[] = [],
 ): string {
   const elements: Array<Record<string, unknown>> = [];
+  const chronologicalContent = buildChronologicalMarkdown(entries);
+  let content = chronologicalContent || preprocessFeishuMarkdown(text);
 
-  // Main text content
-  let content = preprocessFeishuMarkdown(text);
-  const toolMd = buildToolProgressMarkdown(tools);
-  if (toolMd) {
-    content = content ? `${content}\n\n${toolMd}` : toolMd;
+  if (!chronologicalContent) {
+    const toolMd = buildToolProgressMarkdown(tools);
+    if (toolMd) {
+      content = content ? `${content}\n\n${toolMd}` : toolMd;
+    }
   }
 
   if (content) {
@@ -170,10 +235,9 @@ export function buildFinalCardJson(
     }
   }
 
-  return JSON.stringify({
-    schema: '2.0',
+  return buildSchema2Card({
     config: { wide_screen_mode: true },
-    body: { elements },
+    elements,
   });
 }
 
@@ -186,6 +250,7 @@ export function buildPermissionButtonCard(
   text: string,
   permissionRequestId: string,
   chatId?: string,
+  callbackNamespace: 'perm' | 'diag' = 'perm',
 ): string {
   const buttons = [
     { label: 'Allow', type: 'primary', action: 'allow' },
@@ -193,20 +258,27 @@ export function buildPermissionButtonCard(
     { label: 'Deny', type: 'danger', action: 'deny' },
   ];
 
-  const buttonColumns = buttons.map((btn) => ({
-    tag: 'column',
-    width: 'auto',
-    elements: [{
-      tag: 'button',
-      text: { tag: 'plain_text', content: btn.label },
-      type: btn.type,
-      size: 'medium',
-      value: { callback_data: `perm:${btn.action}:${permissionRequestId}`, ...(chatId ? { chatId } : {}) },
+  const buttonRows = buttons.map((btn) => ({
+    tag: 'column_set',
+    flex_mode: 'none',
+    horizontal_align: 'left',
+    columns: [{
+      tag: 'column',
+      width: 'auto',
+      elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: btn.label },
+        type: btn.type,
+        size: 'medium',
+        value: {
+          callback_data: `${callbackNamespace}:${btn.action}:${permissionRequestId}`,
+          ...(chatId ? { chatId } : {}),
+        },
+      }],
     }],
   }));
 
-  return JSON.stringify({
-    schema: '2.0',
+  return buildSchema2Card({
     config: { wide_screen_mode: true },
     header: {
       title: { tag: 'plain_text', content: 'Permission Required' },
@@ -214,24 +286,19 @@ export function buildPermissionButtonCard(
       icon: { tag: 'standard_icon', token: 'lock-chat_filled' },
       padding: '12px 12px 12px 12px',
     },
-    body: {
-      elements: [
-        { tag: 'markdown', content: text, text_size: 'normal' },
-        { tag: 'markdown', content: '⏱ This request will expire in 5 minutes', text_size: 'notation' },
-        { tag: 'hr' },
-        {
-          tag: 'column_set',
-          flex_mode: 'none',
-          horizontal_align: 'left',
-          columns: buttonColumns,
-        },
-        { tag: 'hr' },
-        {
-          tag: 'markdown',
-          content: 'Or reply: `1` Allow · `2` Allow Session · `3` Deny',
-          text_size: 'notation',
-        },
-      ],
-    },
+    elements: [
+      { tag: 'markdown', content: text, text_size: 'normal' },
+      { tag: 'markdown', content: '⏱ This request will expire in 5 minutes', text_size: 'notation' },
+      { tag: 'hr' },
+      ...buttonRows,
+      { tag: 'hr' },
+      {
+        tag: 'markdown',
+        content: callbackNamespace === 'perm'
+          ? 'Or reply: `1` Allow · `2` Allow Session · `3` Deny'
+          : 'Diagnostic card: tap any button to verify callbacks and toast handling',
+        text_size: 'notation',
+      },
+    ],
   });
 }

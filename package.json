@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit",
     "dev": "tsx src/main.ts",
     "test": "node scripts/run-tests.mjs",
+    "feishu:card:test": "tsx scripts/feishu-card-test.ts",
     "bridge:build": "npm --prefix packages/claude-to-im run build",
     "bridge:typecheck": "npm --prefix packages/claude-to-im run typecheck",
     "bridge:test": "npm --prefix packages/claude-to-im test"
