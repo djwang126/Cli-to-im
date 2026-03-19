@@ -302,6 +302,26 @@ describe('FeishuAdapter streaming card lifecycle', () => {
     assert.ok(!calls.some((entry) => entry.name === 'card.update'));
   });
 
+  it('inserts a blank line when text resumes after a thinking phase without a leading newline', async () => {
+    const created = await adapter.createStreamingCard('chat-1', 'reply-1');
+    assert.equal(created, true);
+
+    adapter.onStreamText('chat-1', '上一段');
+    adapter.onToolEvent('chat-1', [{ id: 'tool-1', name: 'workspace.scan', status: 'running' }]);
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    adapter.onStreamText('chat-1', '上一段恢复后的新一段');
+    for (let i = 0; i < 20; i++) {
+      if (calls.filter((entry) => entry.name === 'cardElement.content').length >= 3) break;
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    const streamingContents = calls
+      .filter((entry) => entry.name === 'cardElement.content')
+      .map((entry) => entry.payload.data.content);
+    assert.ok(streamingContents.includes(`上一段\n\n${FEISHU_THINKING_MARKER}`));
+    assert.equal(streamingContents[streamingContents.length - 1], '上一段\n\n恢复后的新一段');
+  });
+
   it('does not perform a full-card refresh on completed streams even if a thinking marker was shown', async () => {
     const created = await adapter.createStreamingCard('chat-1', 'reply-1');
     assert.equal(created, true);
@@ -328,6 +348,80 @@ describe('FeishuAdapter streaming card lifecycle', () => {
     const created = await adapter.createStreamingCard('chat-1', 'reply-1');
     assert.equal(created, false);
     assert.equal(adapter.activeCards.size, 0);
+  });
+
+  it('closes the active streaming card before sending a separate permission card', async () => {
+    const created = await adapter.createStreamingCard('chat-1', 'reply-1');
+    assert.equal(created, true);
+
+    adapter.onStreamText('chat-1', '第一段');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const result = await adapter.send({
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '<b>Need permission</b>',
+      parseMode: 'HTML',
+      inlineButtons: [[
+        { text: 'Allow', callbackData: 'perm:allow:perm-inline-1' },
+      ]],
+    });
+
+    assert.equal(result.ok, true);
+    assert.equal(adapter.activeCards.size, 0);
+    assert.deepEqual(
+      calls.map((entry) => entry.name),
+      [
+        'card.create',
+        'im.message.reply',
+        'cardElement.content',
+        'card.settings',
+        'im.message.create',
+      ],
+    );
+
+    const settingsPayload = calls.find((entry) => entry.name === 'card.settings')?.payload;
+    assert.deepEqual(JSON.parse(settingsPayload.data.settings), { config: { streaming_mode: false } });
+
+    const permissionPayload = calls[calls.length - 1].payload;
+    const permissionCard = JSON.parse(permissionPayload.data.content);
+    const rows = permissionCard.body.elements.filter((el: any) => el.tag === 'column_set');
+    assert.equal(rows.length, 3);
+  });
+
+  it('starts a fresh streaming card after the permission card when more text arrives', async () => {
+    const created = await adapter.createStreamingCard('chat-1', 'reply-1');
+    assert.equal(created, true);
+
+    adapter.onStreamText('chat-1', '第一段');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    await adapter.send({
+      address: { channelType: 'feishu', chatId: 'chat-1' },
+      text: '<b>Need permission</b>',
+      parseMode: 'HTML',
+      inlineButtons: [[
+        { text: 'Allow', callbackData: 'perm:allow:perm-inline-2' },
+      ]],
+    });
+
+    adapter.onStreamText('chat-1', '第一段\n\n批准后继续');
+    for (let i = 0; i < 20; i++) {
+      if (calls.filter((entry) => entry.name === 'card.create').length >= 2
+        && calls.filter((entry) => entry.name === 'cardElement.content').length >= 2) {
+        break;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+
+    assert.equal(calls.filter((entry) => entry.name === 'card.create').length, 2);
+    assert.equal(
+      calls.filter((entry) => entry.name === 'im.message.reply' || entry.name === 'im.message.create').length,
+      3,
+    );
+    const streamingContents = calls
+      .filter((entry) => entry.name === 'cardElement.content')
+      .map((entry) => entry.payload.data.content);
+    assert.equal(streamingContents[streamingContents.length - 1], '第一段\n\n批准后继续');
   });
 });
 

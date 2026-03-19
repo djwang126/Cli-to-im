@@ -69,6 +69,21 @@ function appendRenderedText(entries: FeishuFinalCardEntry[], previous: string, c
   return current;
 }
 
+function appendResumedText(entries: FeishuFinalCardEntry[], checkpoint: string, current: string): void {
+  let delta = current;
+  if (checkpoint && current.startsWith(checkpoint)) {
+    delta = current.slice(checkpoint.length);
+  } else if (checkpoint === current) {
+    delta = '';
+  }
+
+  if (!delta) return;
+  const normalized = checkpoint && !delta.startsWith('\n')
+    ? `\n\n${delta}`
+    : delta;
+  appendTextEntry(entries, normalized);
+}
+
 function hasToolPhaseChange(previousTools: ToolCallInfo[], nextTools: ToolCallInfo[]): boolean {
   const previousStatuses = new Map(previousTools.map((tool) => [tool.id, tool.status]));
   for (const tool of nextTools) {
@@ -96,7 +111,7 @@ function buildCommittedTranscript(
 
   appendRenderedText(next, previousText, toolPhaseTextCheckpoint);
   if (renderedText !== toolPhaseTextCheckpoint) {
-    appendRenderedText(next, toolPhaseTextCheckpoint, renderedText);
+    appendResumedText(next, toolPhaseTextCheckpoint, renderedText);
   }
   return next;
 }

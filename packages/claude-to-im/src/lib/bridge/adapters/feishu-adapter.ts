@@ -79,7 +79,7 @@ interface FeishuCardState {
 }
 
 /** Streaming card throttle interval (ms). */
-const CARD_THROTTLE_MS = 120;
+const CARD_THROTTLE_MS = 200;
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -449,6 +449,21 @@ export class FeishuAdapter extends BaseChannelAdapter {
     this.appendTextEntry(entries, delta);
   }
 
+  private appendResumedText(entries: FeishuFinalCardEntry[], checkpoint: string, renderedText: string): void {
+    let delta = renderedText;
+    if (checkpoint && renderedText.startsWith(checkpoint)) {
+      delta = renderedText.slice(checkpoint.length);
+    } else if (checkpoint === renderedText) {
+      delta = '';
+    }
+
+    if (!delta) return;
+    const normalized = checkpoint && !delta.startsWith('\n')
+      ? `\n\n${delta}`
+      : delta;
+    this.appendTextEntry(entries, normalized);
+  }
+
   private buildCommittedTranscript(
     state: FeishuCardState,
     renderedText: string,
@@ -460,9 +475,14 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }
 
     const checkpoint = state.toolPhaseTextCheckpoint ?? state.lastRenderedText ?? '';
-    this.appendRenderedText(next, state.lastRenderedText, checkpoint);
+    const hasTextEntry = next.some((entry) => entry.kind === 'text');
+    if (!hasTextEntry && checkpoint) {
+      this.appendTextEntry(next, checkpoint);
+    } else {
+      this.appendRenderedText(next, state.lastRenderedText, checkpoint);
+    }
     if (renderedText !== checkpoint) {
-      this.appendRenderedText(next, checkpoint, renderedText);
+      this.appendResumedText(next, checkpoint, renderedText);
     }
     return next;
   }
@@ -497,6 +517,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
     if (last?.kind === 'tools') return;
     state.toolPhasePending = true;
     state.toolPhaseTextCheckpoint = state.pendingText ?? state.lastRenderedText ?? '';
+  }
+
+  private normalizeResumedText(state: FeishuCardState, text: string): string {
+    if (!state.toolPhasePending) return text;
+    const checkpoint = state.toolPhaseTextCheckpoint ?? state.lastRenderedText ?? '';
+    if (!checkpoint || !text.startsWith(checkpoint)) return text;
+    const delta = text.slice(checkpoint.length);
+    if (!delta || delta.startsWith('\n')) return text;
+    return `${checkpoint}\n\n${delta}`;
   }
 
   // ── Streaming Card (CardKit v1 + schema 2.0) ───────────────────
@@ -615,15 +644,16 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private updateCardContent(chatId: string, text: string): void {
     const state = this.activeCards.get(chatId);
     if (!state || !this.restClient) return;
+    const normalizedText = this.normalizeResumedText(state, text);
 
     // Clear thinking state once text arrives
-    if (state.thinking && text.trim()) {
+    if (state.thinking && normalizedText.trim()) {
       state.thinking = false;
     }
-    state.pendingText = text;
+    state.pendingText = normalizedText;
 
     const toolPhaseWaitingForText = state.toolPhasePending
-      && text === (state.toolPhaseTextCheckpoint ?? state.lastRenderedText ?? '');
+      && normalizedText === (state.toolPhaseTextCheckpoint ?? state.lastRenderedText ?? '');
     const toolPhaseResumed = state.toolPhasePending && !toolPhaseWaitingForText;
 
     const elapsed = Date.now() - state.lastUpdateAt;
@@ -850,6 +880,63 @@ export class FeishuAdapter extends BaseChannelAdapter {
   }
 
   /**
+   * Close the current streaming card before sending a separate permission card.
+   * Keeps the old card visible with its latest streamed content, then forgets
+   * the local state so any resumed output starts a fresh streaming card.
+   */
+  private async retireStreamingCardForPermission(chatId: string): Promise<void> {
+    const pending = this.cardCreatePromises.get(chatId);
+    if (pending) {
+      try { await pending; } catch { /* no-op */ }
+    }
+
+    const state = this.activeCards.get(chatId);
+    const cardkit = this.getCardkitV1();
+    if (!state || !this.restClient || !cardkit) {
+      this.cleanupCard(chatId);
+      return;
+    }
+
+    if (state.throttleTimer) {
+      clearTimeout(state.throttleTimer);
+      state.throttleTimer = null;
+    }
+
+    if (state.pendingText && state.pendingText !== state.lastRenderedText) {
+      this.flushCardUpdate(chatId);
+    }
+
+    if (state.inFlightUpdate) {
+      try {
+        await state.inFlightUpdate;
+      } catch {
+        // Best effort only.
+      }
+    }
+
+    try {
+      state.sequence++;
+      this.logCardStage('log', 'close-stream', 'closing streaming mode for separate permission card', {
+        chatId,
+        cardId: state.cardId,
+        sequence: state.sequence,
+      });
+      await cardkit.card.settings({
+        path: { card_id: state.cardId },
+        data: buildCardSettingsData({ streaming_mode: false }, state.sequence),
+      });
+    } catch (err) {
+      this.logCardStage('warn', 'close-stream', this.formatError(err), {
+        chatId,
+        cardId: state.cardId,
+        sequence: state.sequence,
+      });
+    } finally {
+      this.cleanupCard(chatId);
+    }
+  }
+
+  /**
    * Check if there is an active streaming card for a given chat.
    */
   hasActiveCard(chatId: string): boolean {
@@ -1022,6 +1109,10 @@ export class FeishuAdapter extends BaseChannelAdapter {
     const permId = firstBtn?.callbackData?.startsWith('perm:')
       ? firstBtn.callbackData.split(':').slice(2).join(':')
       : '';
+
+    if (this.activeCards.has(chatId)) {
+      await this.retireStreamingCardForPermission(chatId);
+    }
 
     if (permId) {
       // Use real card action buttons
