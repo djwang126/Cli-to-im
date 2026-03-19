@@ -288,6 +288,7 @@ describe('CodexProvider', () => {
     assert.equal(startCalls, 1, 'Should start a fresh Codex thread');
     assert.ok(capturedStartOptions, 'startThread options should be captured');
     assert.ok(!Object.prototype.hasOwnProperty.call(capturedStartOptions!, 'model'), 'Model should not be forwarded by default');
+    assert.equal(capturedStartOptions?.skipGitRepoCheck, true, 'Git repo trust check should be skipped for bridge sessions');
   });
 
   it('passes model only when CTI_CODEX_PASS_MODEL=true', async () => {

@@ -160,6 +160,10 @@ export class CodexProvider implements LLMProvider {
             const threadOptions: Record<string, unknown> = {
               ...(passModel && params.model ? { model: params.model } : {}),
               ...(params.workingDirectory ? { workingDirectory: params.workingDirectory } : {}),
+              // IM bridge sessions often start from a broad default directory
+              // that is not itself a git repo. Let Codex run there instead of
+              // failing the whole turn before any useful work begins.
+              skipGitRepoCheck: true,
               approvalPolicy,
             };
 
