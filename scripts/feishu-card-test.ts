@@ -11,7 +11,7 @@ import {
   buildCardSettingsData,
   buildCardUpdateData,
   resolveFeishuDomain,
-} from '../packages/claude-to-im/src/lib/bridge/adapters/feishu-cardkit.ts';
+} from '#bridge/adapters/feishu-cardkit.js';
 import {
   buildCardContent,
   buildFinalCardJson,
@@ -21,8 +21,8 @@ import {
   FEISHU_THINKING_MARKER,
   formatElapsed,
   type FeishuFinalCardEntry,
-} from '../packages/claude-to-im/src/lib/bridge/markdown/feishu.ts';
-import type { ToolCallInfo } from '../packages/claude-to-im/src/lib/bridge/types.ts';
+} from '#bridge/markdown/feishu.js';
+import type { ToolCallInfo } from '#bridge/types.js';
 
 type Mode = 'static' | 'stream' | 'permission' | 'all';
 

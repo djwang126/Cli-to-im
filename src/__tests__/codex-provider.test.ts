@@ -73,7 +73,7 @@ describe('CodexProvider', () => {
     assert.ok(errorEvent!.data.includes('Missing API key'), 'Error should contain the cause');
   });
 
-  it('maps agent_message item to text SSE event', async () => {
+  it('maps agent_message item to assistant_message SSE event', async () => {
     const { CodexProvider } = await import('../codex-provider.js');
     const { PendingPermissions } = await import('../permission-gateway.js');
     const provider = new CodexProvider(new PendingPermissions());
@@ -91,7 +91,7 @@ describe('CodexProvider', () => {
 
     const events = parseSSEChunks(chunks);
     assert.equal(events.length, 1);
-    assert.equal(events[0].type, 'text');
+    assert.equal(events[0].type, 'assistant_message');
     assert.equal(events[0].data, 'Hello from Codex!');
   });
 
@@ -289,6 +289,7 @@ describe('CodexProvider', () => {
     assert.ok(capturedStartOptions, 'startThread options should be captured');
     assert.ok(!Object.prototype.hasOwnProperty.call(capturedStartOptions!, 'model'), 'Model should not be forwarded by default');
     assert.equal(capturedStartOptions?.skipGitRepoCheck, true, 'Git repo trust check should be skipped for bridge sessions');
+    assert.equal(capturedStartOptions?.sandboxMode, 'workspace-write', 'Default sandbox should allow workspace writes');
   });
 
   it('passes model only when CTI_CODEX_PASS_MODEL=true', async () => {
@@ -330,6 +331,40 @@ describe('CodexProvider', () => {
         process.env.CTI_CODEX_PASS_MODEL = old;
       }
     }
+  });
+
+  it('passes explicit session model override and reasoning effort', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+
+    let capturedStartOptions: Record<string, unknown> | undefined;
+    const mockThread = {
+      runStreamed: () => ({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+        })(),
+      }),
+    };
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = {
+      startThread: (opts: Record<string, unknown>) => {
+        capturedStartOptions = opts;
+        return mockThread;
+      },
+    };
+
+    const stream = provider.streamChat({
+      prompt: 'hello',
+      sessionId: 'session-model-override',
+      model: 'gpt-5.5',
+      forceModel: true,
+      reasoningEffort: 'medium',
+    });
+    await collectStream(stream);
+
+    assert.equal(capturedStartOptions?.model, 'gpt-5.5');
+    assert.equal(capturedStartOptions?.modelReasoningEffort, 'medium');
   });
 
   it('retries with fresh thread when resume fails before any events', async () => {
@@ -380,6 +415,108 @@ describe('CodexProvider', () => {
     assert.equal(startCalls, 1, 'Should fall back to a fresh thread');
     assert.ok(!errorEvent, 'Retry success should not emit error');
     assert.ok(resultEvent, 'Retry success should emit result');
+  });
+
+  it('includes a sandbox mode for ask mode', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+
+    let capturedStartOptions: Record<string, unknown> | undefined;
+    const mockThread = {
+      runStreamed: () => ({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+        })(),
+      }),
+    };
+
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = {
+      startThread: (opts: Record<string, unknown>) => {
+        capturedStartOptions = opts;
+        return mockThread;
+      },
+    };
+
+    const stream = provider.streamChat({
+      prompt: 'hello',
+      sessionId: 'ask-sandbox-session',
+      permissionMode: 'default',
+    });
+
+    await collectStream(stream);
+
+    assert.equal(capturedStartOptions?.approvalPolicy, 'on-request');
+    assert.ok(typeof capturedStartOptions?.sandboxMode === 'string');
+  });
+
+  it('includes a sandbox mode for plan mode', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+
+    let capturedStartOptions: Record<string, unknown> | undefined;
+    const mockThread = {
+      runStreamed: () => ({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+        })(),
+      }),
+    };
+
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = {
+      startThread: (opts: Record<string, unknown>) => {
+        capturedStartOptions = opts;
+        return mockThread;
+      },
+    };
+
+    const stream = provider.streamChat({
+      prompt: 'hello',
+      sessionId: 'plan-sandbox-session',
+      permissionMode: 'plan',
+    });
+
+    await collectStream(stream);
+
+    assert.equal(capturedStartOptions?.approvalPolicy, 'on-request');
+    assert.ok(typeof capturedStartOptions?.sandboxMode === 'string');
+  });
+
+  it('includes a sandbox mode for code mode', async () => {
+    const { CodexProvider } = await import('../codex-provider.js');
+    const { PendingPermissions } = await import('../permission-gateway.js');
+    const provider = new CodexProvider(new PendingPermissions());
+
+    let capturedStartOptions: Record<string, unknown> | undefined;
+    const mockThread = {
+      runStreamed: () => ({
+        events: (async function* () {
+          yield { type: 'turn.completed', usage: { input_tokens: 1, output_tokens: 1, cached_input_tokens: 0 } };
+        })(),
+      }),
+    };
+
+    (provider as any).sdk = { Codex: class { constructor() {} } };
+    (provider as any).codex = {
+      startThread: (opts: Record<string, unknown>) => {
+        capturedStartOptions = opts;
+        return mockThread;
+      },
+    };
+
+    const stream = provider.streamChat({
+      prompt: 'hello',
+      sessionId: 'code-sandbox-session',
+      permissionMode: 'acceptEdits',
+    });
+
+    await collectStream(stream);
+
+    assert.equal(capturedStartOptions?.approvalPolicy, 'never');
+    assert.ok(typeof capturedStartOptions?.sandboxMode === 'string');
   });
 });
 

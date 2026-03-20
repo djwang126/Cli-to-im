@@ -99,6 +99,10 @@ export interface ChannelBinding {
   workingDirectory: string;
   /** Model override for this binding */
   model: string;
+  /** Reasoning effort override for this binding */
+  reasoningEffort?: string;
+  /** Whether the binding's model should be forwarded explicitly to the runtime */
+  modelOverride?: boolean;
   /** Chat mode */
   mode: 'code' | 'plan' | 'ask';
   /** Whether this binding is currently active */

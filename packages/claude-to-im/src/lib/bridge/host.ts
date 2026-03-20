@@ -28,6 +28,7 @@ export interface SSEEvent {
 
 export type SSEEventType =
   | 'text'
+  | 'assistant_message'
   | 'tool_use'
   | 'tool_result'
   | 'tool_output'
@@ -70,6 +71,8 @@ export interface BridgeSession {
   id: string;
   working_directory: string;
   model: string;
+  reasoning_effort?: string;
+  model_override?: boolean;
   system_prompt?: string;
   provider_id?: string;
 }
@@ -133,6 +136,8 @@ export interface UpsertChannelBindingInput {
   sdkSessionId?: string;
   workingDirectory: string;
   model: string;
+  reasoningEffort?: string;
+  modelOverride?: boolean;
   mode?: string;
 }
 
@@ -174,6 +179,10 @@ export interface BridgeStore {
   // ── SDK session ──
   updateSdkSessionId(sessionId: string, sdkSessionId: string): void;
   updateSessionModel(sessionId: string, model: string): void;
+  updateSessionTurnConfig(
+    sessionId: string,
+    updates: Partial<Pick<BridgeSession, 'model' | 'reasoning_effort' | 'model_override'>>,
+  ): void;
   syncSdkTasks(sessionId: string, todos: unknown): void;
 
   // ── Provider ──
@@ -207,6 +216,8 @@ export interface StreamChatParams {
   sessionId: string;
   sdkSessionId?: string;
   model?: string;
+  forceModel?: boolean;
+  reasoningEffort?: string;
   systemPrompt?: string;
   workingDirectory?: string;
   abortController?: AbortController;

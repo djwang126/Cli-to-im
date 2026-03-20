@@ -10,8 +10,13 @@
 
 import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { initBridgeContext } from '../../lib/bridge/context';
+import { BaseChannelAdapter } from '../../lib/bridge/channel-adapter';
 import type { BridgeStore, LifecycleHooks } from '../../lib/bridge/host';
+import type { ChannelType, InboundMessage, OutboundMessage, SendResult } from '../../lib/bridge/types';
 
 // ── Test the session lock mechanism directly ────────────────
 // We test the processWithSessionLock pattern by extracting its logic.
@@ -133,6 +138,175 @@ describe('bridge-manager lifecycle', () => {
   });
 });
 
+describe('bridge-manager codex config helpers', () => {
+  it('writeCodexDefaultModelConfig upserts model settings', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-codex-config-'));
+    const configPath = path.join(tmpDir, 'config.toml');
+    fs.writeFileSync(configPath, '[features]\nmulti_agent = true\n', 'utf-8');
+
+    const { writeCodexDefaultModelConfig } = await import('../../lib/bridge/bridge-manager');
+    writeCodexDefaultModelConfig('gpt-5.5', 'medium', configPath);
+
+    const updated = fs.readFileSync(configPath, 'utf-8');
+    assert.match(updated, /^model = "gpt-5.5"/m);
+    assert.match(updated, /^model_reasoning_effort = "medium"/m);
+    assert.match(updated, /^\[features\]$/m);
+  });
+
+  it('triggerBridgeRestart throws when the script is missing', async () => {
+    const { triggerBridgeRestart } = await import('../../lib/bridge/bridge-manager');
+    assert.throws(() => {
+      triggerBridgeRestart(path.join(os.tmpdir(), 'missing-restart-bridge.bat'));
+    }, /Restart script not found/);
+  });
+});
+
+class MockFeishuCommandAdapter extends BaseChannelAdapter {
+  readonly channelType: ChannelType = 'feishu';
+  readonly sentMessages: OutboundMessage[] = [];
+  readonly browserCalls: Array<{
+    chatId: string;
+    currentPath: string;
+    entries: Array<{ label: string; actionLabel: 'Open' | 'Send'; callbackData: string }>;
+    notice?: string;
+  }> = [];
+  readonly fileCalls: Array<{ chatId: string; absolutePath: string }> = [];
+
+  async start(): Promise<void> {}
+  async stop(): Promise<void> {}
+  isRunning(): boolean { return true; }
+  async consumeOne(): Promise<InboundMessage | null> { return null; }
+  async send(message: OutboundMessage): Promise<SendResult> {
+    this.sentMessages.push(message);
+    return { ok: true, messageId: 'sent-1' };
+  }
+  validateConfig(): string | null { return null; }
+  isAuthorized(): boolean { return true; }
+
+  async sendFileBrowserCard(
+    chatId: string,
+    currentPath: string,
+    entries: Array<{ label: string; actionLabel: 'Open' | 'Send'; callbackData: string }>,
+    notice?: string,
+  ): Promise<SendResult> {
+    this.browserCalls.push({ chatId, currentPath, entries, notice });
+    return { ok: true, messageId: 'browser-1' };
+  }
+
+  async sendLocalFile(chatId: string, absolutePath: string): Promise<SendResult> {
+    this.fileCalls.push({ chatId, absolutePath });
+    return { ok: true, messageId: 'file-1' };
+  }
+}
+
+describe('bridge-manager /file command', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  it('renders a Feishu file browser card for the current working directory', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-file-cmd-'));
+    fs.mkdirSync(path.join(tmpDir, 'src'));
+    fs.writeFileSync(path.join(tmpDir, 'README.md'), '# test', 'utf8');
+
+    try {
+      const store = createCommandStore(tmpDir);
+      initBridgeContext({
+        store,
+        llm: { streamChat: () => new ReadableStream() },
+        permissions: { resolvePendingPermission: () => false },
+        lifecycle: {},
+      });
+
+      const adapter = new MockFeishuCommandAdapter();
+      const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+      await _testOnly.handleMessage(adapter, {
+        messageId: 'msg-1',
+        address: { channelType: 'feishu', chatId: 'chat-1', userId: 'ou-1' },
+        text: '/file',
+        timestamp: Date.now(),
+      });
+
+      assert.equal(adapter.browserCalls.length, 1);
+      assert.equal(adapter.browserCalls[0].currentPath, '.');
+      assert.equal(adapter.browserCalls[0].entries.length, 2);
+      assert.equal(adapter.browserCalls[0].entries[0].actionLabel, 'Open');
+      assert.equal(adapter.browserCalls[0].entries[1].actionLabel, 'Send');
+      assert.equal(adapter.sentMessages.length, 0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('sends a file directly when /file points to a file', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-file-send-'));
+    const filePath = path.join(tmpDir, 'notes.txt');
+    fs.writeFileSync(filePath, 'hello', 'utf8');
+
+    try {
+      const store = createCommandStore(tmpDir);
+      initBridgeContext({
+        store,
+        llm: { streamChat: () => new ReadableStream() },
+        permissions: { resolvePendingPermission: () => false },
+        lifecycle: {},
+      });
+
+      const adapter = new MockFeishuCommandAdapter();
+      const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+      await _testOnly.handleMessage(adapter, {
+        messageId: 'msg-2',
+        address: { channelType: 'feishu', chatId: 'chat-1', userId: 'ou-1' },
+        text: '/file notes.txt',
+        timestamp: Date.now(),
+      });
+
+      assert.deepEqual(adapter.fileCalls, [{ chatId: 'chat-1', absolutePath: filePath }]);
+      assert.equal(adapter.browserCalls.length, 0);
+      assert.equal(adapter.sentMessages.length, 0);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('bridge-manager /whoami command', () => {
+  beforeEach(() => {
+    delete (globalThis as Record<string, unknown>)['__bridge_manager__'];
+    delete (globalThis as Record<string, unknown>)['__bridge_context__'];
+  });
+
+  it('returns the current user and chat identifiers', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-whoami-'));
+
+    try {
+      const store = createCommandStore(tmpDir);
+      initBridgeContext({
+        store,
+        llm: { streamChat: () => new ReadableStream() },
+        permissions: { resolvePendingPermission: () => false },
+        lifecycle: {},
+      });
+
+      const adapter = new MockFeishuCommandAdapter();
+      const { _testOnly } = await import('../../lib/bridge/bridge-manager');
+      await _testOnly.handleMessage(adapter, {
+        messageId: 'msg-whoami-1',
+        address: { channelType: 'feishu', chatId: 'chat-1', userId: 'ou-user-123' },
+        text: '/whoami',
+        timestamp: Date.now(),
+      });
+
+      assert.equal(adapter.sentMessages.length, 1);
+      assert.match(adapter.sentMessages[0].text, /User ID: <code>ou-user-123<\/code>/);
+      assert.match(adapter.sentMessages[0].text, /Chat ID: <code>chat-1<\/code>/);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
 function createMinimalStore(settings: Record<string, string> = {}): BridgeStore {
   return {
     getSetting: (key: string) => settings[key] ?? null,
@@ -151,6 +325,60 @@ function createMinimalStore(settings: Record<string, string> = {}): BridgeStore 
     setSessionRuntimeStatus: () => {},
     updateSdkSessionId: () => {},
     updateSessionModel: () => {},
+    updateSessionTurnConfig: () => {},
+    syncSdkTasks: () => {},
+    getProvider: () => undefined,
+    getDefaultProviderId: () => null,
+    insertAuditLog: () => {},
+    checkDedup: () => false,
+    insertDedup: () => {},
+    cleanupExpiredDedup: () => {},
+    insertOutboundRef: () => {},
+    insertPermissionLink: () => {},
+    getPermissionLink: () => null,
+    markPermissionLinkResolved: () => false,
+    listPendingPermissionLinksByChat: () => [],
+    getChannelOffset: () => '0',
+    setChannelOffset: () => {},
+  };
+}
+
+function createCommandStore(workingDirectory: string): BridgeStore {
+  const binding = {
+    id: 'binding-1',
+    channelType: 'feishu',
+    chatId: 'chat-1',
+    codepilotSessionId: 'session-1',
+    sdkSessionId: '',
+    workingDirectory,
+    model: '',
+    mode: 'code' as const,
+    active: true,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+
+  return {
+    getSetting: (key: string) => {
+      if (key === 'bridge_default_work_dir') return workingDirectory;
+      return null;
+    },
+    getChannelBinding: (channelType: string, chatId: string) => (channelType === 'feishu' && chatId === 'chat-1' ? binding : null),
+    upsertChannelBinding: () => binding,
+    updateChannelBinding: () => {},
+    listChannelBindings: () => [binding],
+    getSession: (id: string) => (id === 'session-1' ? { id, working_directory: workingDirectory, model: '' } : null),
+    createSession: () => ({ id: 'session-1', working_directory: workingDirectory, model: '' }),
+    updateSessionProviderId: () => {},
+    addMessage: () => {},
+    getMessages: () => ({ messages: [] }),
+    acquireSessionLock: () => true,
+    renewSessionLock: () => {},
+    releaseSessionLock: () => {},
+    setSessionRuntimeStatus: () => {},
+    updateSdkSessionId: () => {},
+    updateSessionModel: () => {},
+    updateSessionTurnConfig: () => {},
     syncSdkTasks: () => {},
     getProvider: () => undefined,
     getDefaultProviderId: () => null,

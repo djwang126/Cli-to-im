@@ -44,7 +44,7 @@ class InMemoryStore implements BridgeStore {
     return this.bindings.get(`${channelType}:${chatId}`) ?? null;
   }
 
-  upsertChannelBinding(data: { channelType: string; chatId: string; codepilotSessionId: string; sdkSessionId?: string; workingDirectory: string; model: string; mode?: string }) {
+  upsertChannelBinding(data: { channelType: string; chatId: string; codepilotSessionId: string; sdkSessionId?: string; workingDirectory: string; model: string; reasoningEffort?: string; modelOverride?: boolean; mode?: string }) {
     const key = `${data.channelType}:${data.chatId}`;
     const existing = this.bindings.get(key);
     const id = existing?.id || `binding-${this.nextId++}`;
@@ -56,6 +56,8 @@ class InMemoryStore implements BridgeStore {
       sdkSessionId: data.sdkSessionId ?? existing?.sdkSessionId ?? '',
       workingDirectory: data.workingDirectory ?? existing?.workingDirectory ?? '',
       model: data.model ?? existing?.model ?? '',
+      reasoningEffort: data.reasoningEffort ?? existing?.reasoningEffort,
+      modelOverride: data.modelOverride ?? existing?.modelOverride ?? false,
       mode: (data.mode as ChannelBinding['mode']) ?? existing?.mode ?? 'code',
       active: existing?.active ?? true,
       createdAt: existing?.createdAt ?? new Date().toISOString(),
@@ -94,6 +96,7 @@ class InMemoryStore implements BridgeStore {
   setSessionRuntimeStatus() {}
   updateSdkSessionId() {}
   updateSessionModel() {}
+  updateSessionTurnConfig() {}
   syncSdkTasks() {}
   getProvider() { return undefined; }
   getDefaultProviderId() { return null; }

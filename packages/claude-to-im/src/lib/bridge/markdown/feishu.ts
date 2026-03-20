@@ -18,6 +18,11 @@ export interface FeishuFinalCardEntry {
   kind: 'text' | 'tools';
   content: string;
 }
+export interface FeishuFileBrowserEntry {
+  label: string;
+  actionLabel: 'Open' | 'Send';
+  callbackData: string;
+}
 
 function buildSchema2Card(params: {
   header?: Record<string, unknown>;
@@ -300,5 +305,77 @@ export function buildPermissionButtonCard(
         text_size: 'notation',
       },
     ],
+  });
+}
+
+/**
+ * Build a file browser card for the Feishu adapter.
+ * Each entry is rendered as a two-column row: file/folder name + action button.
+ */
+export function buildFileBrowserCard(
+  currentPath: string,
+  entries: FeishuFileBrowserEntry[],
+  chatId?: string,
+  notice?: string,
+): string {
+  const rows = entries.map((entry) => ({
+    tag: 'column_set',
+    flex_mode: 'stretch',
+    background_style: 'default',
+    columns: [
+      {
+        tag: 'column',
+        width: 'weighted',
+        weight: 5,
+        elements: [
+          {
+            tag: 'markdown',
+            content: entry.label,
+          },
+        ],
+      },
+      {
+        tag: 'column',
+        width: 'auto',
+        elements: [
+          {
+            tag: 'button',
+            text: { tag: 'plain_text', content: entry.actionLabel },
+            type: entry.actionLabel === 'Send' ? 'primary' : 'default',
+            size: 'small',
+            value: {
+              callback_data: entry.callbackData,
+              ...(chatId ? { chatId } : {}),
+            },
+          },
+        ],
+      },
+    ],
+  }));
+
+  const elements: FeishuCardElement[] = [
+    { tag: 'markdown', content: `Current path: \`${currentPath}\``, text_size: 'notation' },
+    { tag: 'hr' },
+  ];
+
+  if (notice) {
+    elements.push({ tag: 'markdown', content: notice, text_size: 'notation' });
+    elements.push({ tag: 'hr' });
+  }
+
+  if (rows.length === 0) {
+    elements.push({ tag: 'markdown', content: '_Directory is empty._' });
+  } else {
+    elements.push(...rows);
+  }
+
+  return buildSchema2Card({
+    config: { wide_screen_mode: true },
+    header: {
+      title: { tag: 'plain_text', content: 'Workspace Files' },
+      template: 'wathet',
+      padding: '12px 12px 12px 12px',
+    },
+    elements,
   });
 }

@@ -51,6 +51,7 @@ function createMockStore(settings: Record<string, string> = {}) {
     setSessionRuntimeStatus: () => {},
     updateSdkSessionId: () => {},
     updateSessionModel: () => {},
+    updateSessionTurnConfig: () => {},
     syncSdkTasks: () => {},
     getProvider: () => undefined,
     getDefaultProviderId: () => null,

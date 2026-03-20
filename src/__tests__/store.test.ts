@@ -72,6 +72,31 @@ describe('JsonFileStore', () => {
     assert.equal(b2.codepilotSessionId, 'sess-2');
   });
 
+  it('upsertChannelBinding clears stale sdkSessionId when switching sessions', () => {
+    const store = new JsonFileStore(makeSettings());
+    const b1 = store.upsertChannelBinding({
+      channelType: 'telegram',
+      chatId: '123',
+      codepilotSessionId: 'sess-1',
+      sdkSessionId: 'sdk-old',
+      workingDirectory: '/tmp',
+      model: 'model-1',
+    });
+
+    const b2 = store.upsertChannelBinding({
+      channelType: 'telegram',
+      chatId: '123',
+      codepilotSessionId: 'sess-2',
+      workingDirectory: '/tmp/new',
+      model: 'model-2',
+      mode: 'code',
+    });
+
+    assert.equal(b2.id, b1.id);
+    assert.equal(b2.codepilotSessionId, 'sess-2');
+    assert.equal(b2.sdkSessionId, '');
+  });
+
   it('upsertChannelBinding uses default mode from settings', () => {
     const settings = makeSettings();
     settings.set('bridge_default_mode', 'plan');
@@ -315,6 +340,20 @@ describe('JsonFileStore', () => {
     store.updateSessionModel(session.id, 'model-new');
     const updated = store.getSession(session.id);
     assert.equal(updated?.model, 'model-new');
+  });
+
+  it('updateSessionTurnConfig updates reasoning effort and model override', () => {
+    const store = new JsonFileStore(makeSettings());
+    const session = store.createSession('test', 'model-old', undefined, '/tmp');
+    store.updateSessionTurnConfig(session.id, {
+      model: 'gpt-5.5',
+      reasoning_effort: 'medium',
+      model_override: true,
+    });
+    const updated = store.getSession(session.id);
+    assert.equal(updated?.model, 'gpt-5.5');
+    assert.equal(updated?.reasoning_effort, 'medium');
+    assert.equal(updated?.model_override, true);
   });
 
   // ── Provider (no-op) ──

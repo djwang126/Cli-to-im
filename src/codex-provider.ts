@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 
-import type { LLMProvider, StreamChatParams } from '../packages/claude-to-im/src/lib/bridge/host.js';
+import type { LLMProvider, StreamChatParams } from '#bridge/host.js';
 import type { PendingPermissions } from './permission-gateway.js';
 import { sseEvent } from './sse-utils.js';
 
@@ -37,16 +37,32 @@ type ThreadInstance = any;
 
 /**
  * Map bridge permission modes to Codex approval policies.
- * - 'acceptEdits' (code mode) → 'on-failure' (auto-approve most things)
+ * - 'acceptEdits' (code mode) → 'never' (auto-approve most things)
  * - 'plan' → 'on-request' (ask before executing)
  * - 'default' (ask mode) → 'on-request'
  */
 function toApprovalPolicy(permissionMode?: string): string {
   switch (permissionMode) {
-    case 'acceptEdits': return 'on-failure';
+    case 'acceptEdits': return 'never';
     case 'plan': return 'on-request';
     case 'default': return 'on-request';
     default: return 'on-request';
+  }
+}
+
+/**
+ * Map bridge permission modes to Codex sandbox policies.
+ * - 'default' (ask mode) → 'read-only'
+ * - 'plan' / 'acceptEdits' (plan/code mode) → 'workspace-write'
+ */
+function toSandboxMode(permissionMode?: string): string {
+  switch (permissionMode) {
+    case 'default': return 'read-only';
+    case 'plan':
+    case 'acceptEdits':
+      return 'danger-full-access';
+    default:
+      return 'workspace-write';
   }
 }
 
@@ -155,16 +171,19 @@ export class CodexProvider implements LLMProvider {
             }
 
             const approvalPolicy = toApprovalPolicy(params.permissionMode);
-            const passModel = shouldPassModelToCodex();
+            const sandboxMode = toSandboxMode(params.permissionMode);
+            const passModel = shouldPassModelToCodex() || params.forceModel === true;
 
             const threadOptions: Record<string, unknown> = {
               ...(passModel && params.model ? { model: params.model } : {}),
+              ...(params.reasoningEffort ? { modelReasoningEffort: params.reasoningEffort } : {}),
               ...(params.workingDirectory ? { workingDirectory: params.workingDirectory } : {}),
               // IM bridge sessions often start from a broad default directory
               // that is not itself a git repo. Let Codex run there instead of
               // failing the whole turn before any useful work begins.
               skipGitRepoCheck: true,
               approvalPolicy,
+              sandboxMode,
             };
 
             // Build input: Codex SDK UserInput supports { type: "text" } and
@@ -315,7 +334,10 @@ export class CodexProvider implements LLMProvider {
       case 'agent_message': {
         const text = (item.text as string) || '';
         if (text) {
-          controller.enqueue(sseEvent('text', text));
+          // Codex emits complete assistant messages, not token deltas.
+          // Forward them as replace-style updates so the bridge keeps only
+          // the latest candidate response instead of appending duplicates.
+          controller.enqueue(sseEvent('assistant_message', text));
         }
         break;
       }

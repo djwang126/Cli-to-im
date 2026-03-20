@@ -17,6 +17,9 @@ export interface Config {
   feishuAppSecret?: string;
   feishuDomain?: string;
   feishuAllowedUsers?: string[];
+  feishuRequireMention?: boolean;
+  feishuGroupPolicy?: string;
+  feishuGroupAllowFrom?: string[];
   // Discord
   discordBotToken?: string;
   discordAllowedUsers?: string[];
@@ -89,6 +92,11 @@ export function loadConfig(): Config {
     feishuAppSecret: env.get("CTI_FEISHU_APP_SECRET") || undefined,
     feishuDomain: env.get("CTI_FEISHU_DOMAIN") || undefined,
     feishuAllowedUsers: splitCsv(env.get("CTI_FEISHU_ALLOWED_USERS")),
+    feishuRequireMention: env.has("CTI_FEISHU_REQUIRE_MENTION")
+      ? env.get("CTI_FEISHU_REQUIRE_MENTION") === "true"
+      : undefined,
+    feishuGroupPolicy: env.get("CTI_FEISHU_GROUP_POLICY") || undefined,
+    feishuGroupAllowFrom: splitCsv(env.get("CTI_FEISHU_GROUP_ALLOW_FROM")),
     discordBotToken: env.get("CTI_DISCORD_BOT_TOKEN") || undefined,
     discordAllowedUsers: splitCsv(env.get("CTI_DISCORD_ALLOWED_USERS")),
     discordAllowedChannels: splitCsv(
@@ -136,6 +144,16 @@ export function saveConfig(config: Config): void {
     "CTI_FEISHU_ALLOWED_USERS",
     config.feishuAllowedUsers?.join(",")
   );
+  if (config.feishuRequireMention !== undefined)
+    out += formatEnvLine(
+      "CTI_FEISHU_REQUIRE_MENTION",
+      String(config.feishuRequireMention)
+    );
+  out += formatEnvLine("CTI_FEISHU_GROUP_POLICY", config.feishuGroupPolicy);
+  out += formatEnvLine(
+    "CTI_FEISHU_GROUP_ALLOW_FROM",
+    config.feishuGroupAllowFrom?.join(",")
+  );
   out += formatEnvLine("CTI_DISCORD_BOT_TOKEN", config.discordBotToken);
   out += formatEnvLine(
     "CTI_DISCORD_ALLOWED_USERS",
@@ -174,6 +192,7 @@ export function maskSecret(value: string): string {
 export function configToSettings(config: Config): Map<string, string> {
   const m = new Map<string, string>();
   m.set("remote_bridge_enabled", "true");
+  m.set("bridge_runtime", config.runtime);
 
   // ── Telegram ──
   // Upstream keys: telegram_bot_token, bridge_telegram_enabled,
@@ -212,7 +231,9 @@ export function configToSettings(config: Config): Map<string, string> {
 
   // ── Feishu ──
   // Upstream keys: bridge_feishu_app_id, bridge_feishu_app_secret,
-  //   bridge_feishu_domain, bridge_feishu_enabled, bridge_feishu_allowed_users
+  //   bridge_feishu_domain, bridge_feishu_enabled, bridge_feishu_allowed_users,
+  //   bridge_feishu_require_mention, bridge_feishu_group_policy,
+  //   bridge_feishu_group_allow_from
   m.set(
     "bridge_feishu_enabled",
     config.enabledChannels.includes("feishu") ? "true" : "false"
@@ -223,6 +244,12 @@ export function configToSettings(config: Config): Map<string, string> {
   if (config.feishuDomain) m.set("bridge_feishu_domain", config.feishuDomain);
   if (config.feishuAllowedUsers)
     m.set("bridge_feishu_allowed_users", config.feishuAllowedUsers.join(","));
+  if (config.feishuRequireMention !== undefined)
+    m.set("bridge_feishu_require_mention", String(config.feishuRequireMention));
+  if (config.feishuGroupPolicy)
+    m.set("bridge_feishu_group_policy", config.feishuGroupPolicy);
+  if (config.feishuGroupAllowFrom)
+    m.set("bridge_feishu_group_allow_from", config.feishuGroupAllowFrom.join(","));
 
   // ── QQ ──
   // Upstream keys: bridge_qq_enabled, bridge_qq_app_id, bridge_qq_app_secret,

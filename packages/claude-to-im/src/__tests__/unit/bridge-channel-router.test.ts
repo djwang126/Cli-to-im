@@ -14,14 +14,16 @@ import { describe, it, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { initBridgeContext } from '../../lib/bridge/context';
 import * as router from '../../lib/bridge/channel-router';
-import type { BridgeStore, LLMProvider, PermissionGateway, LifecycleHooks } from '../../lib/bridge/host';
+import type { BridgeSession, BridgeStore, LLMProvider, PermissionGateway, LifecycleHooks } from '../../lib/bridge/host';
 import type { ChannelBinding } from '../../lib/bridge/types';
 
 // ── Mock Store ──────────────────────────────────────────────
 
-function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding>; sessions: Map<string, { id: string; working_directory: string; model: string }> } {
+type MockSession = BridgeSession & { sdk_session_id?: string };
+
+function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding>; sessions: Map<string, MockSession> } {
   const bindings = new Map<string, ChannelBinding>();
-  const sessions = new Map<string, { id: string; working_directory: string; model: string }>();
+  const sessions = new Map<string, MockSession>();
   let nextId = 1;
 
   return {
@@ -37,17 +39,20 @@ function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding
       return bindings.get(`${channelType}:${chatId}`) ?? null;
     },
     upsertChannelBinding(data) {
+      const existing = bindings.get(`${data.channelType}:${data.chatId}`);
       const binding: ChannelBinding = {
-        id: `binding-${nextId++}`,
+        id: existing?.id || `binding-${nextId++}`,
         channelType: data.channelType,
         chatId: data.chatId,
         codepilotSessionId: data.codepilotSessionId,
-        sdkSessionId: '',
+        sdkSessionId: data.sdkSessionId ?? existing?.sdkSessionId ?? '',
         workingDirectory: data.workingDirectory,
         model: data.model,
-        mode: 'code',
-        active: true,
-        createdAt: new Date().toISOString(),
+        reasoningEffort: data.reasoningEffort ?? existing?.reasoningEffort,
+        modelOverride: data.modelOverride ?? existing?.modelOverride ?? false,
+        mode: (data.mode as ChannelBinding['mode']) ?? existing?.mode ?? 'code',
+        active: existing?.active ?? true,
+        createdAt: existing?.createdAt ?? new Date().toISOString(),
         updatedAt: new Date().toISOString(),
       };
       bindings.set(`${data.channelType}:${data.chatId}`, binding);
@@ -82,6 +87,7 @@ function createMockStore(): BridgeStore & { bindings: Map<string, ChannelBinding
     setSessionRuntimeStatus() {},
     updateSdkSessionId() {},
     updateSessionModel() {},
+    updateSessionTurnConfig() {},
     syncSdkTasks() {},
     getProvider() { return undefined; },
     getDefaultProviderId() { return null; },
@@ -182,6 +188,19 @@ describe('channel-router', () => {
     );
     assert.ok(binding);
     assert.equal(binding!.codepilotSessionId, session.id);
+  });
+
+  it('bindToSession() carries over the session sdkSessionId', () => {
+    const session = store.createSession('Test', 'claude-3', undefined, '/test');
+    store.sessions.set(session.id, { ...session, sdk_session_id: 'sdk-existing' });
+
+    const binding = router.bindToSession(
+      { channelType: 'telegram', chatId: '789' },
+      session.id,
+    );
+
+    assert.ok(binding);
+    assert.equal(binding!.sdkSessionId, 'sdk-existing');
   });
 
   it('listBindings() filters by channel type', () => {

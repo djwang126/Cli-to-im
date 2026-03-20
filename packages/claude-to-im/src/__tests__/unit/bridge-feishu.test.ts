@@ -1,5 +1,8 @@
 import { beforeEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 import { initBridgeContext } from '../../lib/bridge/context';
 import { FeishuAdapter } from '../../lib/bridge/adapters/feishu-adapter';
@@ -13,6 +16,7 @@ import {
 import {
   FEISHU_THINKING_MARKER,
   buildFinalCardJson,
+  buildFileBrowserCard,
   buildPermissionButtonCard,
   buildStreamingContent,
   buildStreamingCardJson,
@@ -39,6 +43,7 @@ function createMockStore(settings: Record<string, string> = {}) {
     setSessionRuntimeStatus: () => {},
     updateSdkSessionId: () => {},
     updateSessionModel: () => {},
+    updateSessionTurnConfig: () => {},
     syncSdkTasks: () => {},
     getProvider: () => undefined,
     getDefaultProviderId: () => null,
@@ -105,12 +110,50 @@ function buildMockRestClient(calls: Array<{ name: string; payload: any }>) {
           return { data: { message_id: 'msg-reply-1' } };
         },
       },
+      file: {
+        create: async (payload: any) => {
+          calls.push({ name: 'im.file.create', payload });
+          return { file_key: 'file-key-1' };
+        },
+      },
       messageReaction: {
-        create: async () => ({ data: { reaction_id: 'reaction-1' } }),
-        delete: async () => ({}),
+        create: async (payload: any) => {
+          calls.push({ name: 'im.messageReaction.create', payload });
+          const emojiType = payload?.data?.reaction_type?.emoji_type ?? 'reaction';
+          return { data: { reaction_id: `reaction-${emojiType}` } };
+        },
+        delete: async (payload: any) => {
+          calls.push({ name: 'im.messageReaction.delete', payload });
+          return {};
+        },
       },
     },
   };
+}
+
+async function finalizeCompletedCard(adapter: any, chatId: string, responseText: string) {
+  const originalSetTimeout = globalThis.setTimeout;
+  let delayedRefresh: (() => void) | null = null;
+  (globalThis as any).setTimeout = ((handler: (...args: any[]) => void, timeout?: number, ...args: any[]) => {
+    if (timeout === 5000) {
+      delayedRefresh = () => handler(...args);
+      return 1;
+    }
+    return originalSetTimeout(handler, timeout, ...args);
+  }) as typeof setTimeout;
+
+  try {
+    const finalizePromise = adapter.onStreamEnd(chatId, 'completed', responseText);
+    for (let i = 0; i < 50 && !delayedRefresh; i++) {
+      await new Promise((resolve) => originalSetTimeout(resolve, 0));
+    }
+    assert.ok(delayedRefresh);
+    const runDelayedRefresh = delayedRefresh as () => void;
+    runDelayedRefresh();
+    return await finalizePromise;
+  } finally {
+    (globalThis as any).setTimeout = originalSetTimeout;
+  }
 }
 
 describe('feishu card helpers', () => {
@@ -177,6 +220,20 @@ describe('feishu card helpers', () => {
       'diag:deny:diag-live',
     ]);
   });
+
+  it('builds file browser cards with two-column action rows', () => {
+    const card = JSON.parse(buildFileBrowserCard('src', [
+      { label: '📁 subdir', actionLabel: 'Open', callbackData: 'file:open:c3ViZGly' },
+      { label: '📄 notes.md', actionLabel: 'Send', callbackData: 'file:send:bm90ZXMubWQ' },
+    ], 'chat-1', 'Showing first 2 items.'));
+
+    assert.equal(card.header.title.content, 'Workspace Files');
+    const rows = card.body.elements.filter((el: any) => el.tag === 'column_set');
+    assert.equal(rows.length, 2);
+    assert.equal(rows[0].columns[1].elements[0].text.content, 'Open');
+    assert.equal(rows[1].columns[1].elements[0].text.content, 'Send');
+    assert.equal(rows[1].columns[1].elements[0].value.callback_data, 'file:send:bm90ZXMubWQ');
+  });
 });
 
 describe('FeishuAdapter send paths', () => {
@@ -229,6 +286,151 @@ describe('FeishuAdapter send paths', () => {
       'perm:deny:perm-1',
     ]);
   });
+
+  it('sends workspace browser cards as interactive messages', async () => {
+    const result = await adapter.sendFileBrowserCard('chat-1', '.', [
+      { label: '📁 src', actionLabel: 'Open', callbackData: 'file:open:c3Jj' },
+      { label: '📄 README.md', actionLabel: 'Send', callbackData: 'file:send:UkVBRE1FLm1k' },
+    ]);
+
+    assert.equal(result.ok, true);
+    const sent = calls.find((entry) => entry.name === 'im.message.create');
+    assert.equal(sent?.payload?.data?.msg_type, 'interactive');
+    const card = JSON.parse(sent?.payload?.data?.content);
+    const rows = card.body.elements.filter((el: any) => el.tag === 'column_set');
+    assert.equal(rows.length, 2);
+  });
+
+  it('uploads a local file and then sends it as a file message', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cti-feishu-file-'));
+    const filePath = path.join(tmpDir, 'notes.txt');
+    fs.writeFileSync(filePath, 'hello from test', 'utf8');
+
+    try {
+      const result = await adapter.sendLocalFile('chat-1', filePath);
+      assert.equal(result.ok, true);
+      assert.deepEqual(
+        calls.map((entry) => entry.name),
+        ['im.file.create', 'im.message.create'],
+      );
+      assert.equal(calls[0].payload.data.file_name, 'notes.txt');
+      assert.equal(calls[1].payload.data.msg_type, 'file');
+      assert.deepEqual(JSON.parse(calls[1].payload.data.content), { file_key: 'file-key-1' });
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe('FeishuAdapter inbound filtering', () => {
+  it('ignores messages sent by bots to avoid self-trigger loops', async () => {
+    const store = createMockStore();
+    setupContext(store);
+    const adapter: any = new FeishuAdapter();
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'bot',
+        sender_id: { open_id: 'bot-open-id' },
+      },
+      message: {
+        message_id: 'msg-bot-1',
+        chat_id: 'chat-1',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: '@_user_1 hello' }),
+        create_time: String(Date.now()),
+        mentions: [{ key: '@_user_1', id: { open_id: 'bot-open-id' }, name: 'Bot' }],
+      },
+    });
+
+    assert.equal(adapter.queue.length, 0);
+  });
+
+  it('accepts group text without @mention when require_mention=false', async () => {
+    const store = createMockStore({
+      bridge_feishu_require_mention: 'false',
+      bridge_feishu_allowed_users: 'ou-user-1',
+    });
+    setupContext(store);
+    const adapter: any = new FeishuAdapter();
+
+    await adapter.processIncomingEvent({
+      sender: {
+        sender_type: 'user',
+        sender_id: { open_id: 'ou-user-1' },
+      },
+      message: {
+        message_id: 'msg-user-1',
+        chat_id: 'chat-1',
+        chat_type: 'group',
+        message_type: 'text',
+        content: JSON.stringify({ text: '直接说话，不用@' }),
+        create_time: String(Date.now()),
+        mentions: [],
+      },
+    });
+
+    assert.equal(adapter.queue.length, 1);
+    assert.equal(adapter.queue[0].text, '直接说话，不用@');
+    assert.equal(adapter.queue[0].address.userId, 'ou-user-1');
+  });
+});
+
+describe('FeishuAdapter reactions', () => {
+  let store: MockStore;
+  let adapter: any;
+  let calls: Array<{ name: string; payload: any }>;
+
+  beforeEach(() => {
+    store = createMockStore();
+    setupContext(store);
+    calls = [];
+    adapter = new FeishuAdapter() as any;
+    adapter.restClient = buildMockRestClient(calls);
+    adapter.createStreamingCard = async () => true;
+  });
+
+  it('removes the typing reaction before adding the follow-up completion reaction', async () => {
+    adapter.lastIncomingMessageId.set('chat-1', 'msg-1');
+
+    adapter.onMessageStart('chat-1');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    adapter.onMessageEnd('chat-1');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    assert.deepEqual(
+      calls
+        .filter((entry) => entry.name.startsWith('im.messageReaction'))
+        .map((entry) => ({
+          name: entry.name,
+          emoji: entry.payload?.data?.reaction_type?.emoji_type ?? null,
+          reactionId: entry.payload?.path?.reaction_id ?? null,
+        })),
+      [
+        { name: 'im.messageReaction.create', emoji: 'Get', reactionId: null },
+        { name: 'im.messageReaction.delete', emoji: null, reactionId: 'reaction-Get' },
+        { name: 'im.messageReaction.create', emoji: 'DONE', reactionId: null },
+      ],
+    );
+  });
+
+  it('cleans up the typing reaction on the original message even if a newer inbound message arrives', async () => {
+    adapter.lastIncomingMessageId.set('chat-1', 'msg-1');
+
+    adapter.onMessageStart('chat-1');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    adapter.lastIncomingMessageId.set('chat-1', 'msg-2');
+    adapter.onMessageEnd('chat-1');
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    const reactionCalls = calls.filter((entry) => entry.name.startsWith('im.messageReaction'));
+    assert.equal(reactionCalls[1].payload.path.message_id, 'msg-1');
+    assert.equal(reactionCalls[1].payload.path.reaction_id, 'reaction-Get');
+    assert.equal(reactionCalls[2].payload.path.message_id, 'msg-1');
+  });
 });
 
 describe('FeishuAdapter streaming card lifecycle', () => {
@@ -244,14 +446,28 @@ describe('FeishuAdapter streaming card lifecycle', () => {
     adapter.restClient = buildMockRestClient(calls);
   });
 
-  it('uses CardKit v1 create -> content -> settings sequence and skips full refresh when content already matches', async () => {
+  it('uses CardKit v1 create -> content -> update -> settings sequence for completed streams', async () => {
     const created = await adapter.createStreamingCard('chat-1', 'reply-1');
     assert.equal(created, true);
 
     adapter.onStreamText('chat-1', 'Hello from stream');
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    const finalized = await adapter.onStreamEnd('chat-1', 'completed', 'Hello from final card');
+    const finalizedPromise = finalizeCompletedCard(adapter, 'chat-1', 'Hello from final card');
+    for (let i = 0; i < 10 && calls.filter((entry) => entry.name === 'card.update').length === 0; i++) {
+      await Promise.resolve();
+    }
+    assert.deepEqual(
+      calls.map((entry) => entry.name),
+      [
+        'card.create',
+        'im.message.reply',
+        'cardElement.content',
+        'card.update',
+      ],
+    );
+    assert.ok(!calls.some((entry) => entry.name === 'card.settings'));
+    const finalized = await finalizedPromise;
     assert.equal(finalized, true);
 
     assert.deepEqual(
@@ -260,6 +476,7 @@ describe('FeishuAdapter streaming card lifecycle', () => {
         'card.create',
         'im.message.reply',
         'cardElement.content',
+        'card.update',
         'card.settings',
       ],
     );
@@ -272,9 +489,11 @@ describe('FeishuAdapter streaming card lifecycle', () => {
     assert.equal(contentPayload.path.element_id, FEISHU_STREAMING_ELEMENT_ID);
     assert.equal(contentPayload.data.sequence, 1);
 
-    const settingsPayload = calls[3].payload;
+    const updatePayload = calls[3].payload;
+    assert.equal(updatePayload.data.sequence, 2);
+    const settingsPayload = calls[4].payload;
     assert.deepEqual(JSON.parse(settingsPayload.data.settings), { config: { streaming_mode: false } });
-    assert.ok(!calls.some((entry) => entry.name === 'card.update'));
+    assert.equal(settingsPayload.data.sequence, 3);
   });
 
   it('shows a temporary thinking marker during tool phases and removes it once text resumes', async () => {
@@ -291,7 +510,7 @@ describe('FeishuAdapter streaming card lifecycle', () => {
     ]);
     adapter.onStreamText('chat-1', '第一段\n\n第二段');
 
-    const finalized = await adapter.onStreamEnd('chat-1', 'completed', '第一段\n\n第二段');
+    const finalized = await finalizeCompletedCard(adapter, 'chat-1', '第一段\n\n第二段');
     assert.equal(finalized, true);
 
     const streamingContents = calls
@@ -299,7 +518,7 @@ describe('FeishuAdapter streaming card lifecycle', () => {
       .map((entry) => entry.payload.data.content);
     assert.ok(streamingContents.some((content) => content === `第一段\n\n${FEISHU_THINKING_MARKER}`));
     assert.equal(streamingContents[streamingContents.length - 1], '第一段\n\n第二段');
-    assert.ok(!calls.some((entry) => entry.name === 'card.update'));
+    assert.ok(calls.some((entry) => entry.name === 'card.update'));
   });
 
   it('inserts a blank line when text resumes after a thinking phase without a leading newline', async () => {
@@ -322,7 +541,7 @@ describe('FeishuAdapter streaming card lifecycle', () => {
     assert.equal(streamingContents[streamingContents.length - 1], '上一段\n\n恢复后的新一段');
   });
 
-  it('does not perform a full-card refresh on completed streams even if a thinking marker was shown', async () => {
+  it('performs an immediate full-card refresh on interrupted streams', async () => {
     const created = await adapter.createStreamingCard('chat-1', 'reply-1');
     assert.equal(created, true);
 
@@ -330,14 +549,24 @@ describe('FeishuAdapter streaming card lifecycle', () => {
     adapter.onToolEvent('chat-1', [{ id: 'tool-1', name: 'workspace.scan', status: 'running' }]);
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    const finalized = await adapter.onStreamEnd('chat-1', 'completed', '第一段');
+    const finalized = await adapter.onStreamEnd('chat-1', 'interrupted', '第一段');
     assert.equal(finalized, true);
 
     const streamingContents = calls
       .filter((entry) => entry.name === 'cardElement.content')
       .map((entry) => entry.payload.data.content);
     assert.ok(streamingContents.includes(`第一段\n\n${FEISHU_THINKING_MARKER}`));
-    assert.ok(!calls.some((entry) => entry.name === 'card.update'));
+    assert.deepEqual(
+      calls.map((entry) => entry.name),
+      [
+        'card.create',
+        'im.message.reply',
+        'cardElement.content',
+        'cardElement.content',
+        'card.update',
+        'card.settings',
+      ],
+    );
   });
 
   it('returns false instead of throwing when card creation fails', async () => {
@@ -468,5 +697,23 @@ describe('FeishuAdapter card action callbacks', () => {
     });
     assert.equal(adapter.queue.length, 1);
     assert.equal(adapter.queue[0].callbackData, 'perm:allow:perm-1');
+  });
+
+  it('converts file card actions into synthetic /file commands', async () => {
+    const result = await adapter.handleCardAction({
+      action: { value: { callback_data: 'file:send:bm90ZXMudHh0', chatId: 'chat-1' } },
+      context: { open_chat_id: 'chat-1', open_message_id: 'om-1' },
+      operator: { open_id: 'ou-1' },
+    });
+
+    assert.deepEqual(result, {
+      toast: {
+        type: 'info',
+        content: '已收到，正在发送文件...',
+      },
+    });
+    assert.equal(adapter.queue.length, 1);
+    assert.equal(adapter.queue[0].text, '/file --send-b64 bm90ZXMudHh0');
+    assert.equal(adapter.queue[0].callbackData, undefined);
   });
 });

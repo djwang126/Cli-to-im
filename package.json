@@ -3,12 +3,16 @@
   "version": "0.1.0",
   "description": "Claude Code Skill: Bridge IM platforms (Telegram, Discord, Feishu, QQ) to Claude Code sessions",
   "type": "module",
+  "imports": {
+    "#bridge/*": "./packages/claude-to-im/dist/lib/bridge/*"
+  },
   "scripts": {
-    "build": "node scripts/build.js",
-    "typecheck": "tsc --noEmit",
-    "dev": "tsx src/main.ts",
+    "build": "npm run bridge:build && npm run build:daemon",
+    "build:daemon": "node scripts/build.js",
+    "typecheck": "tsc -b --pretty false",
+    "dev": "npm run bridge:build && tsx src/main.ts",
     "test": "node scripts/run-tests.mjs",
-    "feishu:card:test": "tsx scripts/feishu-card-test.ts",
+    "feishu:card:test": "npm run bridge:build && tsx scripts/feishu-card-test.ts",
     "bridge:build": "npm --prefix packages/claude-to-im run build",
     "bridge:typecheck": "npm --prefix packages/claude-to-im run typecheck",
     "bridge:test": "npm --prefix packages/claude-to-im test"

@@ -16,6 +16,9 @@
     "sourceMap": true,
     "noEmit": true
   },
+  "references": [
+    { "path": "./packages/claude-to-im/tsconfig.build.json" }
+  ],
   "include": ["src/**/*.ts"],
   "exclude": ["node_modules", "dist"]
 }

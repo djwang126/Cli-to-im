@@ -18,8 +18,8 @@ import type {
   PermissionLinkRecord,
   OutboundRefInput,
   UpsertChannelBindingInput,
-} from '../packages/claude-to-im/src/lib/bridge/host.js';
-import type { ChannelBinding, ChannelType } from '../packages/claude-to-im/src/lib/bridge/types.js';
+} from '#bridge/host.js';
+import type { ChannelBinding, ChannelType } from '#bridge/types.js';
 import { CTI_HOME } from './config.js';
 
 const DATA_DIR = path.join(CTI_HOME, 'data');
@@ -210,11 +210,16 @@ export class JsonFileStore implements BridgeStore {
     const key = `${data.channelType}:${data.chatId}`;
     const existing = this.bindings.get(key);
     if (existing) {
+      const sessionChanged = existing.codepilotSessionId !== data.codepilotSessionId;
       const updated: ChannelBinding = {
         ...existing,
         codepilotSessionId: data.codepilotSessionId,
+        sdkSessionId: data.sdkSessionId ?? (sessionChanged ? '' : existing.sdkSessionId),
         workingDirectory: data.workingDirectory,
         model: data.model,
+        reasoningEffort: data.reasoningEffort ?? existing.reasoningEffort,
+        modelOverride: data.modelOverride ?? existing.modelOverride ?? false,
+        mode: (data.mode as ChannelBinding['mode']) ?? existing.mode,
         updatedAt: now(),
       };
       this.bindings.set(key, updated);
@@ -229,6 +234,8 @@ export class JsonFileStore implements BridgeStore {
       sdkSessionId: '',
       workingDirectory: data.workingDirectory,
       model: data.model,
+      reasoningEffort: data.reasoningEffort,
+      modelOverride: data.modelOverride ?? false,
       mode: (this.settings.get('bridge_default_mode') as 'code' | 'plan' | 'ask') || 'code',
       active: true,
       createdAt: now(),
@@ -359,6 +366,17 @@ export class JsonFileStore implements BridgeStore {
     const s = this.sessions.get(sessionId);
     if (s) {
       s.model = model;
+      this.persistSessions();
+    }
+  }
+
+  updateSessionTurnConfig(
+    sessionId: string,
+    updates: Partial<Pick<BridgeSession, 'model' | 'reasoning_effort' | 'model_override'>>,
+  ): void {
+    const s = this.sessions.get(sessionId);
+    if (s) {
+      Object.assign(s, updates);
       this.persistSessions();
     }
   }

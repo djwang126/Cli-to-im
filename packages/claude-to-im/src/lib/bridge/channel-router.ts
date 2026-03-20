@@ -60,6 +60,8 @@ export function createBinding(
     sdkSessionId: '',
     workingDirectory: defaultCwd,
     model: defaultModel,
+    reasoningEffort: session.reasoning_effort,
+    modelOverride: session.model_override ?? false,
     mode: 'code',
   });
 }
@@ -74,13 +76,17 @@ export function bindToSession(
   const { store } = getBridgeContext();
   const session = store.getSession(codepilotSessionId);
   if (!session) return null;
+  const sdkSessionId = (session as { sdk_session_id?: string }).sdk_session_id || '';
 
   return store.upsertChannelBinding({
     channelType: address.channelType,
     chatId: address.chatId,
     codepilotSessionId,
+    sdkSessionId,
     workingDirectory: session.working_directory,
     model: session.model,
+    reasoningEffort: session.reasoning_effort,
+    modelOverride: session.model_override ?? false,
   });
 }
 
@@ -89,7 +95,7 @@ export function bindToSession(
  */
 export function updateBinding(
   id: string,
-  updates: Partial<Pick<ChannelBinding, 'sdkSessionId' | 'workingDirectory' | 'model' | 'mode' | 'active'>>,
+  updates: Partial<Pick<ChannelBinding, 'sdkSessionId' | 'workingDirectory' | 'model' | 'reasoningEffort' | 'modelOverride' | 'mode' | 'active'>>,
 ): void {
   getBridgeContext().store.updateChannelBinding(id, updates);
 }

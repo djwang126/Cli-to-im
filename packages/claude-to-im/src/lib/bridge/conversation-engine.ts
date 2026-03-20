@@ -139,6 +139,8 @@ export async function processMessage(
 
     // Effective model
     const effectiveModel = binding.model || session?.model || store.getSetting('default_model') || undefined;
+    const effectiveReasoningEffort = binding.reasoningEffort || session?.reasoning_effort || undefined;
+    const forceModel = binding.modelOverride || session?.model_override || false;
 
     // Permission mode from binding mode
     let permissionMode: string;
@@ -169,6 +171,8 @@ export async function processMessage(
       sessionId,
       sdkSessionId: binding.sdkSessionId || undefined,
       model: effectiveModel,
+      forceModel,
+      reasoningEffort: effectiveReasoningEffort,
       systemPrompt: session?.system_prompt || undefined,
       workingDirectory: binding.workingDirectory || session?.working_directory || undefined,
       abortController,
@@ -207,6 +211,7 @@ async function consumeStream(
   const reader = stream.getReader();
   const contentBlocks: MessageContentBlock[] = [];
   let currentText = '';
+  let currentTextMode: 'append' | 'replace' = 'append';
   /** Monotonically accumulated text for streaming preview — never resets on tool_use. */
   let previewText = '';
   let tokenUsage: TokenUsage | null = null;
@@ -235,16 +240,29 @@ async function consumeStream(
         switch (event.type) {
           case 'text':
             currentText += event.data;
+            currentTextMode = 'append';
             if (onPartialText) {
               previewText += event.data;
               try { onPartialText(previewText); } catch { /* non-critical */ }
             }
             break;
 
+          case 'assistant_message':
+            currentText = event.data;
+            currentTextMode = 'replace';
+            if (onPartialText) {
+              previewText = event.data;
+              try { onPartialText(previewText); } catch { /* non-critical */ }
+            }
+            break;
+
           case 'tool_use': {
             if (currentText.trim()) {
-              contentBlocks.push({ type: 'text', text: currentText });
+              if (currentTextMode === 'append') {
+                contentBlocks.push({ type: 'text', text: currentText });
+              }
               currentText = '';
+              currentTextMode = 'append';
             }
             try {
               const toolData = JSON.parse(event.data);

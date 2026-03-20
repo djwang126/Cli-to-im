@@ -82,11 +82,17 @@ describe('configToSettings', () => {
       feishuAppSecret: 'app-secret',
       feishuDomain: 'example.com',
       feishuAllowedUsers: ['fu1'],
+      feishuRequireMention: false,
+      feishuGroupPolicy: 'open',
+      feishuGroupAllowFrom: ['chat-1', 'chat-2'],
     });
     assert.equal(m.get('bridge_feishu_app_id'), 'app-id');
     assert.equal(m.get('bridge_feishu_app_secret'), 'app-secret');
     assert.equal(m.get('bridge_feishu_domain'), 'example.com');
     assert.equal(m.get('bridge_feishu_allowed_users'), 'fu1');
+    assert.equal(m.get('bridge_feishu_require_mention'), 'false');
+    assert.equal(m.get('bridge_feishu_group_policy'), 'open');
+    assert.equal(m.get('bridge_feishu_group_allow_from'), 'chat-1,chat-2');
   });
 
   it('sets bridge_qq_enabled based on enabledChannels', () => {

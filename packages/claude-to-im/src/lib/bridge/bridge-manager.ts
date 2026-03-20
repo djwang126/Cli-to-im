@@ -7,6 +7,10 @@
  * Uses globalThis to survive Next.js HMR in development.
  */
 
+import { spawn } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import type { BridgeStatus, InboundMessage, OutboundMessage, StreamingPreviewState, ToolCallInfo } from './types.js';
 import { createAdapter, getRegisteredTypes } from './channel-adapter.js';
 import type { BaseChannelAdapter } from './channel-adapter.js';
@@ -57,6 +61,95 @@ function getStreamConfig(channelType = 'telegram'): StreamConfig {
   const minDeltaChars = parseInt(store.getSetting(`${prefix}min_delta_chars`) || '', 10) || defaults.minDeltaChars;
   const maxChars = parseInt(store.getSetting(`${prefix}max_chars`) || '', 10) || defaults.maxChars;
   return { intervalMs, minDeltaChars, maxChars };
+}
+
+const CODEX_REASONING_EFFORTS = new Set(['minimal', 'low', 'medium', 'high', 'xhigh']);
+const DEFAULT_CODEX_CONFIG_PATH = path.join(os.homedir(), '.codex', 'config.toml');
+const DEFAULT_RESTART_SCRIPT_PATH = path.resolve(process.cwd(), 'restart-bridge.bat');
+
+interface ModelCommandArgs {
+  model: string;
+  reasoningEffort: string;
+}
+
+interface FeishuFileCapableAdapter {
+  sendFileBrowserCard(
+    chatId: string,
+    currentPath: string,
+    entries: Array<{ label: string; actionLabel: 'Open' | 'Send'; callbackData: string }>,
+    notice?: string,
+  ): Promise<SendResult>;
+  sendLocalFile(chatId: string, absolutePath: string): Promise<SendResult>;
+}
+
+interface ParsedFileCommandArgs {
+  mode: 'browse' | 'send';
+  requestedPath: string;
+  error?: string;
+}
+
+const FILE_BROWSER_MAX_ITEMS = 40;
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function parseModelCommandArgs(raw: string): ModelCommandArgs | null {
+  const parts = raw.split(/\s+/).map(part => part.trim()).filter(Boolean);
+  if (parts.length !== 2) return null;
+  const [model, reasoningEffortRaw] = parts;
+  const reasoningEffort = reasoningEffortRaw.toLowerCase();
+  if (!CODEX_REASONING_EFFORTS.has(reasoningEffort)) return null;
+  return { model, reasoningEffort };
+}
+
+function getConfiguredRuntime(): string {
+  const { store } = getBridgeContext();
+  return (store.getSetting('bridge_runtime') || process.env.CTI_RUNTIME || 'claude').toLowerCase();
+}
+
+function upsertTomlString(content: string, key: string, value: string): string {
+  const line = `${key} = ${JSON.stringify(value)}`;
+  const pattern = new RegExp(`^\\s*${escapeRegExp(key)}\\s*=.*$`, 'm');
+  if (pattern.test(content)) {
+    return content.replace(pattern, line);
+  }
+  const trimmed = content.trimEnd();
+  return trimmed ? `${trimmed}\n${line}\n` : `${line}\n`;
+}
+
+export function writeCodexDefaultModelConfig(
+  model: string,
+  reasoningEffort: string,
+  configPath = DEFAULT_CODEX_CONFIG_PATH,
+): void {
+  let content = '';
+  try {
+    content = fs.readFileSync(configPath, 'utf-8');
+  } catch {
+    // Create a new config file when none exists yet.
+  }
+
+  let updated = upsertTomlString(content, 'model', model);
+  updated = upsertTomlString(updated, 'model_reasoning_effort', reasoningEffort);
+
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  const tmpPath = `${configPath}.tmp`;
+  fs.writeFileSync(tmpPath, updated, 'utf-8');
+  fs.renameSync(tmpPath, configPath);
+}
+
+export function triggerBridgeRestart(scriptPath = DEFAULT_RESTART_SCRIPT_PATH): void {
+  if (!fs.existsSync(scriptPath)) {
+    throw new Error(`Restart script not found: ${scriptPath}`);
+  }
+  const child = spawn('cmd.exe', ['/c', scriptPath], {
+    cwd: path.dirname(scriptPath),
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: true,
+  });
+  child.unref();
 }
 
 /**
@@ -358,6 +451,64 @@ export function getStatus(): BridgeStatus {
       };
     }),
   };
+}
+
+function isFeishuFileCapableAdapter(adapter: BaseChannelAdapter): adapter is BaseChannelAdapter & FeishuFileCapableAdapter {
+  const candidate = adapter as Partial<FeishuFileCapableAdapter> & { channelType?: string };
+  return candidate.channelType === 'feishu'
+    && typeof candidate.sendFileBrowserCard === 'function'
+    && typeof candidate.sendLocalFile === 'function';
+}
+
+function isWithinDirectory(rootDir: string, targetPath: string): boolean {
+  const relative = path.relative(rootDir, targetPath);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function toDisplayRelativePath(rootDir: string, targetPath: string): string {
+  const relative = path.relative(rootDir, targetPath);
+  if (!relative) return '.';
+  return relative.split(path.sep).join('/');
+}
+
+function encodeFileBrowserPath(relativePath: string): string {
+  return Buffer.from(relativePath, 'utf8').toString('base64url');
+}
+
+function decodeFileBrowserPath(encoded: string): string | null {
+  try {
+    return Buffer.from(encoded, 'base64url').toString('utf8');
+  } catch {
+    return null;
+  }
+}
+
+function escapeFileLabel(value: string): string {
+  return value.replace(/\\/g, '\\\\').replace(/([`*_{}\[\]()#+\-.!|>~])/g, '\\$1');
+}
+
+function parseFileCommandArgs(raw: string): ParsedFileCommandArgs {
+  if (!raw) {
+    return { mode: 'browse', requestedPath: '' };
+  }
+
+  const sendMatch = raw.match(/^--send-b64\s+(\S+)$/);
+  if (sendMatch) {
+    const decoded = decodeFileBrowserPath(sendMatch[1]);
+    return decoded == null
+      ? { mode: 'send', requestedPath: '', error: 'Invalid file action payload.' }
+      : { mode: 'send', requestedPath: decoded };
+  }
+
+  const openMatch = raw.match(/^--open-b64\s+(\S+)$/);
+  if (openMatch) {
+    const decoded = decodeFileBrowserPath(openMatch[1]);
+    return decoded == null
+      ? { mode: 'browse', requestedPath: '', error: 'Invalid file action payload.' }
+      : { mode: 'browse', requestedPath: decoded };
+  }
+
+  return { mode: 'browse', requestedPath: raw.trim() };
 }
 
 /**
@@ -791,6 +942,7 @@ async function handleCommand(
   }
 
   let response = '';
+  let postResponseAction: (() => void) | null = null;
 
   switch (command) {
     case '/start':
@@ -804,9 +956,14 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
+        '/model &lt;model&gt; &lt;effort&gt; - Set model for this session',
+        '/default-model &lt;model&gt; &lt;effort&gt; - Set global Codex default model',
+        '/restart - Restart the bridge daemon',
         '/status - Show current status',
+        '/whoami - Show your user/chat IDs',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
+        '/file [path] - Browse or send files from the current working directory (Feishu only)',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission',
         '/help - Show this help',
       ].join('\n');
@@ -881,8 +1038,84 @@ async function handleCommand(
       break;
     }
 
+    case '/model': {
+      const parsed = parseModelCommandArgs(args);
+      if (!parsed) {
+        response = 'Usage: /model &lt;model&gt; &lt;minimal|low|medium|high|xhigh&gt;';
+        break;
+      }
+      const binding = router.resolve(msg.address);
+      store.updateSessionTurnConfig(binding.codepilotSessionId, {
+        model: parsed.model,
+        reasoning_effort: parsed.reasoningEffort,
+        model_override: true,
+      });
+      store.updateSdkSessionId(binding.codepilotSessionId, '');
+      router.updateBinding(binding.id, {
+        model: parsed.model,
+        reasoningEffort: parsed.reasoningEffort,
+        modelOverride: true,
+      });
+      const runtime = getConfiguredRuntime();
+      response = [
+        'Session model updated.',
+        `Model: <code>${escapeHtml(parsed.model)}</code>`,
+        `Reasoning: <code>${escapeHtml(parsed.reasoningEffort)}</code>`,
+        runtime === 'codex'
+          ? 'Codex runtime will use this override on the next turn.'
+          : `Current runtime is <code>${escapeHtml(runtime)}</code>; reasoning effort only applies on Codex.`,
+      ].join('\n');
+      break;
+    }
+
+    case '/default-model': {
+      const parsed = parseModelCommandArgs(args);
+      if (!parsed) {
+        response = 'Usage: /default-model &lt;model&gt; &lt;minimal|low|medium|high|xhigh&gt;';
+        break;
+      }
+      const runtime = getConfiguredRuntime();
+      if (runtime !== 'codex') {
+        response = `Current runtime is <code>${escapeHtml(runtime)}</code>; skipped updating Codex global config.`;
+        break;
+      }
+      try {
+        writeCodexDefaultModelConfig(parsed.model, parsed.reasoningEffort);
+        response = [
+          'Updated Codex global defaults.',
+          `Model: <code>${escapeHtml(parsed.model)}</code>`,
+          `Reasoning: <code>${escapeHtml(parsed.reasoningEffort)}</code>`,
+        ].join('\n');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        response = `Failed to update Codex config: <code>${escapeHtml(message)}</code>`;
+      }
+      break;
+    }
+
+    case '/restart': {
+      try {
+        if (!fs.existsSync(DEFAULT_RESTART_SCRIPT_PATH)) {
+          throw new Error(`Restart script not found: ${DEFAULT_RESTART_SCRIPT_PATH}`);
+        }
+        postResponseAction = () => {
+          try {
+            triggerBridgeRestart();
+          } catch (error) {
+            console.error('[bridge-manager] Failed to trigger restart:', error);
+          }
+        };
+        response = 'Restart requested. Restart script is launching...';
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        response = `Failed to launch restart script: <code>${escapeHtml(message)}</code>`;
+      }
+      break;
+    }
+
     case '/status': {
       const binding = router.resolve(msg.address);
+      const session = store.getSession(binding.codepilotSessionId);
       response = [
         '<b>Bridge Status</b>',
         '',
@@ -890,6 +1123,18 @@ async function handleCommand(
         `CWD: <code>${escapeHtml(binding.workingDirectory || '~')}</code>`,
         `Mode: <b>${binding.mode}</b>`,
         `Model: <code>${binding.model || 'default'}</code>`,
+        `Reasoning: <code>${binding.reasoningEffort || session?.reasoning_effort || 'default'}</code>`,
+      ].join('\n');
+      break;
+    }
+
+    case '/whoami': {
+      response = [
+        '<b>Identity</b>',
+        '',
+        `Channel: <code>${escapeHtml(msg.address.channelType)}</code>`,
+        `User ID: <code>${escapeHtml(msg.address.userId || 'unavailable')}</code>`,
+        `Chat ID: <code>${escapeHtml(msg.address.chatId)}</code>`,
       ].join('\n');
       break;
     }
@@ -923,6 +1168,140 @@ async function handleCommand(
       break;
     }
 
+    case '/file': {
+      if (!isFeishuFileCapableAdapter(adapter)) {
+        response = 'The /file command is currently available on Feishu only.';
+        break;
+      }
+
+      const binding = router.resolve(msg.address);
+      const rootDir = (binding.workingDirectory || '').trim();
+      if (!rootDir || !path.isAbsolute(rootDir)) {
+        response = 'Working directory is not configured to an absolute path.';
+        break;
+      }
+
+      const resolvedRootDir = path.resolve(rootDir);
+      if (!fs.existsSync(resolvedRootDir)) {
+        response = `Working directory not found: <code>${escapeHtml(resolvedRootDir)}</code>`;
+        break;
+      }
+
+      let rootStat: fs.Stats;
+      try {
+        rootStat = fs.statSync(resolvedRootDir);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        response = `Failed to read working directory: <code>${escapeHtml(message)}</code>`;
+        break;
+      }
+      if (!rootStat.isDirectory()) {
+        response = `Working directory is not a directory: <code>${escapeHtml(resolvedRootDir)}</code>`;
+        break;
+      }
+
+      const parsed = parseFileCommandArgs(args);
+      if (parsed.error) {
+        response = parsed.error;
+        break;
+      }
+
+      const targetPath = parsed.requestedPath
+        ? path.resolve(resolvedRootDir, parsed.requestedPath)
+        : resolvedRootDir;
+      if (!isWithinDirectory(resolvedRootDir, targetPath)) {
+        response = 'Path must stay within the current working directory.';
+        break;
+      }
+      if (!fs.existsSync(targetPath)) {
+        response = `Path not found: <code>${escapeHtml(toDisplayRelativePath(resolvedRootDir, targetPath))}</code>`;
+        break;
+      }
+
+      let targetStat: fs.Stats;
+      try {
+        targetStat = fs.statSync(targetPath);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        response = `Failed to inspect path: <code>${escapeHtml(message)}</code>`;
+        break;
+      }
+
+      if (parsed.mode === 'send' || targetStat.isFile()) {
+        if (!targetStat.isFile()) {
+          response = 'Cannot send a directory. Use /file <folder> to open it.';
+          break;
+        }
+        const sendResult = await adapter.sendLocalFile(msg.address.chatId, targetPath);
+        if (!sendResult.ok) {
+          response = `Failed to send file: <code>${escapeHtml(sendResult.error || 'unknown error')}</code>`;
+        }
+        break;
+      }
+
+      if (!targetStat.isDirectory()) {
+        response = 'Unsupported path type.';
+        break;
+      }
+
+      let dirEntries: fs.Dirent[];
+      try {
+        dirEntries = fs.readdirSync(targetPath, { withFileTypes: true });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        response = `Failed to read directory: <code>${escapeHtml(message)}</code>`;
+        break;
+      }
+
+      const sortedEntries = dirEntries
+        .filter((entry) => entry.isDirectory() || entry.isFile())
+        .sort((left, right) => {
+          const leftRank = left.isDirectory() ? 0 : 1;
+          const rightRank = right.isDirectory() ? 0 : 1;
+          if (leftRank !== rightRank) return leftRank - rightRank;
+          return left.name.localeCompare(right.name, undefined, { sensitivity: 'base' });
+        });
+
+      const cardEntries: Array<{ label: string; actionLabel: 'Open' | 'Send'; callbackData: string }> = [];
+      if (targetPath !== resolvedRootDir) {
+        const parentPath = path.dirname(targetPath);
+        const parentRelative = toDisplayRelativePath(resolvedRootDir, parentPath) === '.'
+          ? ''
+          : path.relative(resolvedRootDir, parentPath);
+        cardEntries.push({
+          label: '📁 `..`',
+          actionLabel: 'Open',
+          callbackData: parentRelative ? `file:open:${encodeFileBrowserPath(parentRelative)}` : 'file:open',
+        });
+      }
+
+      const visibleEntries = sortedEntries.slice(0, FILE_BROWSER_MAX_ITEMS);
+      for (const entry of visibleEntries) {
+        const absoluteEntryPath = path.join(targetPath, entry.name);
+        const relativeEntryPath = path.relative(resolvedRootDir, absoluteEntryPath);
+        cardEntries.push({
+          label: `${entry.isDirectory() ? '📁' : '📄'} ${escapeFileLabel(entry.name)}`,
+          actionLabel: entry.isDirectory() ? 'Open' : 'Send',
+          callbackData: `file:${entry.isDirectory() ? 'open' : 'send'}:${encodeFileBrowserPath(relativeEntryPath)}`,
+        });
+      }
+
+      const truncatedCount = sortedEntries.length - visibleEntries.length;
+      const notice = truncatedCount > 0
+        ? `Showing first ${visibleEntries.length} items. ${truncatedCount} more item(s) are hidden.`
+        : undefined;
+      const browseResult = await adapter.sendFileBrowserCard(
+        msg.address.chatId,
+        toDisplayRelativePath(resolvedRootDir, targetPath),
+        cardEntries,
+        notice,
+      );
+      if (!browseResult.ok) {
+        response = `Failed to send file browser: <code>${escapeHtml(browseResult.error || 'unknown error')}</code>`;
+      }
+      break;
+    }
+
     case '/perm': {
       // Text-based permission approval fallback (for channels without inline buttons)
       // Usage: /perm allow <id> | /perm allow_session <id> | /perm deny <id>
@@ -951,9 +1330,14 @@ async function handleCommand(
         '/bind &lt;session_id&gt; - Bind to existing session',
         '/cwd /path - Change working directory',
         '/mode plan|code|ask - Change mode',
+        '/model &lt;model&gt; &lt;effort&gt; - Set model for this session',
+        '/default-model &lt;model&gt; &lt;effort&gt; - Set global Codex default model',
+        '/restart - Restart the bridge daemon',
         '/status - Show current status',
+        '/whoami - Show your user/chat IDs',
         '/sessions - List recent sessions',
         '/stop - Stop current session',
+        '/file [path] - Browse or send files from the current working directory (Feishu only)',
         '/perm allow|allow_session|deny &lt;id&gt; - Respond to permission request',
         '1/2/3 - Quick permission reply (Feishu/QQ, single pending)',
         '/help - Show this help',
@@ -971,6 +1355,9 @@ async function handleCommand(
       parseMode: 'HTML',
       replyToMessageId: msg.messageId,
     });
+  }
+  if (postResponseAction) {
+    setTimeout(postResponseAction, 0);
   }
 }
 

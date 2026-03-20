@@ -16,6 +16,8 @@
  */
 
 import crypto from 'crypto';
+import fs from 'node:fs';
+import path from 'node:path';
 import * as lark from '@larksuiteoapi/node-sdk';
 import type {
   ChannelType,
@@ -37,8 +39,10 @@ import {
   buildStreamingCardJson,
   buildFinalCardJson,
   buildPermissionButtonCard,
+  buildFileBrowserCard,
   FEISHU_THINKING_MARKER,
   formatElapsed,
+  type FeishuFileBrowserEntry,
   type FeishuFinalCardEntry,
 } from '../markdown/feishu.js';
 import {
@@ -55,9 +59,11 @@ const DEDUP_MAX = 1000;
 
 /** Max file download size (20 MB). */
 const MAX_FILE_SIZE = 20 * 1024 * 1024;
+const MAX_UPLOAD_FILE_SIZE = 30 * 1024 * 1024;
 
-/** Feishu emoji type for typing indicator (same as Openclaw). */
-const TYPING_EMOJI = 'Typing';
+/** Feishu emoji type for typing indicator. */
+const TYPING_EMOJI = 'Get';
+const COMPLETION_EMOJI_CANDIDATES = ['DONE'];
 
 /** State for an active CardKit v1 streaming card entity (schema 2.0 payload). */
 interface FeishuCardState {
@@ -80,6 +86,7 @@ interface FeishuCardState {
 
 /** Streaming card throttle interval (ms). */
 const CARD_THROTTLE_MS = 200;
+const COMPLETED_FINAL_CARD_DELAY_MS = 5000;
 
 /** Shape of the SDK's im.message.receive_v1 event data. */
 type FeishuMessageEventData = {
@@ -132,8 +139,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
   private botIds = new Set<string>();
   /** Track last incoming message ID per chat for typing indicator. */
   private lastIncomingMessageId = new Map<string, string>();
-  /** Track active typing reaction IDs per chat for cleanup. */
-  private typingReactions = new Map<string, string>();
+  /** Track active typing reactions per chat for cleanup on the original message. */
+  private typingReactions = new Map<string, { reactionId: string; messageId: string }>();
   /** Active streaming card state per chatId. */
   private activeCards = new Map<string, FeishuCardState>();
   /** In-flight card creation promises per chatId — prevents duplicate creation. */
@@ -296,7 +303,7 @@ export class FeishuAdapter extends BaseChannelAdapter {
     }).then((res) => {
       const reactionId = (res as any)?.data?.reaction_id;
       if (reactionId) {
-        this.typingReactions.set(chatId, reactionId);
+        this.typingReactions.set(chatId, { reactionId, messageId });
       }
     }).catch((err) => {
       const code = (err as { code?: number })?.code;
@@ -314,14 +321,22 @@ export class FeishuAdapter extends BaseChannelAdapter {
     // Clean up any orphaned card state (normally cleaned by finalizeCard)
     this.cleanupCard(chatId);
 
-    // Remove typing reaction (same as before)
-    const reactionId = this.typingReactions.get(chatId);
-    const messageId = this.lastIncomingMessageId.get(chatId);
-    if (!reactionId || !messageId || !this.restClient) return;
+    // Remove typing reaction, then add a follow-up reaction once cleanup completes.
+    const typingReaction = this.typingReactions.get(chatId);
+    if (!typingReaction || !this.restClient) return;
     this.typingReactions.delete(chatId);
+    const { reactionId, messageId } = typingReaction;
     this.restClient.im.messageReaction.delete({
       path: { message_id: messageId, reaction_id: reactionId },
-    }).catch(() => { /* ignore */ });
+    }).then(async () => {
+      await this.addCompletionReaction(messageId);
+    }).catch(async (err) => {
+      const code = (err as { code?: number })?.code;
+      if (code !== 99991400 && code !== 99991403) {
+        console.warn('[feishu-adapter] Typing indicator cleanup failed:', err instanceof Error ? err.message : err);
+      }
+      await this.addCompletionReaction(messageId);
+    });
   }
 
   // ── Card Action Handler ─────────────────────────────────────
@@ -364,6 +379,35 @@ export class FeishuAdapter extends BaseChannelAdapter {
         return { toast: { type: 'info' as const, content: `诊断按钮已收到：${action}` } };
       }
 
+      if (callbackData.startsWith('file:')) {
+        const parts = callbackData.split(':');
+        const action = parts[1];
+        const encodedPath = parts[2] || '';
+        const text = action === 'send'
+          ? `/file --send-b64 ${encodedPath}`
+          : encodedPath
+            ? `/file --open-b64 ${encodedPath}`
+            : '/file';
+        const fileActionMsg: import('../types.js').InboundMessage = {
+          messageId: messageId || `card_action_${Date.now()}`,
+          address: {
+            channelType: 'feishu',
+            chatId,
+            userId,
+          },
+          text,
+          timestamp: Date.now(),
+          callbackMessageId: messageId,
+        };
+        this.enqueue(fileActionMsg);
+        return {
+          toast: {
+            type: 'info' as const,
+            content: action === 'send' ? '已收到，正在发送文件...' : '已收到，正在打开目录...',
+          },
+        };
+      }
+
       const callbackMsg: import('../types.js').InboundMessage = {
         messageId: messageId || `card_action_${Date.now()}`,
         address: {
@@ -392,6 +436,27 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return null;
     }
     return cardkit;
+  }
+
+  private async addCompletionReaction(messageId: string): Promise<void> {
+    if (!this.restClient) return;
+
+    for (const emojiType of COMPLETION_EMOJI_CANDIDATES) {
+      try {
+        await this.restClient.im.messageReaction.create({
+          path: { message_id: messageId },
+          data: { reaction_type: { emoji_type: emojiType } },
+        });
+        return;
+      } catch (err) {
+        const code = (err as { code?: number })?.code;
+        if (code === 99991400 || code === 99991403) {
+          continue;
+        }
+        console.warn('[feishu-adapter] Completion reaction failed:', err instanceof Error ? err.message : err);
+        return;
+      }
+    }
   }
 
   private formatError(err: unknown): string {
@@ -709,7 +774,8 @@ export class FeishuAdapter extends BaseChannelAdapter {
           data: { content, sequence: seq },
         });
         state.transcript = committedTranscript;
-        if (!toolPhaseWaitingForText) {
+        const hasNewerQueuedUpdate = state.sequence !== seq;
+        if (!toolPhaseWaitingForText && !hasNewerQueuedUpdate) {
           state.toolPhasePending = false;
           state.toolPhaseTextCheckpoint = null;
         }
@@ -792,40 +858,11 @@ export class FeishuAdapter extends BaseChannelAdapter {
 
     const finalText = state.lastRenderedText || state.finalText || state.pendingText || '';
     this.ensureTextCaptured(state, finalText);
-    const needsFinalCardRefresh = status !== 'completed' || state.toolPhasePending;
     state.toolPhasePending = false;
     state.toolPhaseTextCheckpoint = null;
 
     try {
-      // Step 1: Close streaming mode
-      state.sequence++;
-      this.logCardStage('log', 'close-stream', 'closing streaming mode', {
-        chatId,
-        cardId: state.cardId,
-        sequence: state.sequence,
-      });
-      await cardkit.card.settings({
-        path: { card_id: state.cardId },
-        data: buildCardSettingsData({ streaming_mode: false }, state.sequence),
-      });
-    } catch (err) {
-      this.logCardStage('warn', 'close-stream', this.formatError(err), {
-        chatId,
-        cardId: state.cardId,
-        sequence: state.sequence,
-      });
-      this.activeCards.delete(chatId);
-      return false;
-    }
-
-    if (!needsFinalCardRefresh) {
-      console.log(`[feishu-adapter] Card finalized without full-card refresh: cardId=${state.cardId}, status=${status}`);
-      this.activeCards.delete(chatId);
-      return true;
-    }
-
-    try {
-      // Step 2: Build and apply final card
+      // Step 1: Build and apply the final card while streaming mode is still enabled.
       const statusLabels: Record<string, string> = {
         completed: '✅ Completed',
         interrupted: '⚠️ Interrupted',
@@ -836,6 +873,15 @@ export class FeishuAdapter extends BaseChannelAdapter {
         status: statusLabels[status] || status,
         elapsed: formatElapsed(elapsedMs),
       };
+
+      if (status === 'completed') {
+        this.logCardStage('log', 'final-update', 'completed card waiting before full refresh', {
+          chatId,
+          cardId: state.cardId,
+          delayMs: COMPLETED_FINAL_CARD_DELAY_MS,
+        });
+        await new Promise((resolve) => setTimeout(resolve, COMPLETED_FINAL_CARD_DELAY_MS));
+      }
 
       const finalCardJson = buildFinalCardJson(finalText, state.toolCalls, footer, state.transcript);
 
@@ -852,13 +898,34 @@ export class FeishuAdapter extends BaseChannelAdapter {
       });
 
       console.log(`[feishu-adapter] Card finalized: cardId=${state.cardId}, status=${status}, elapsed=${formatElapsed(elapsedMs)}`);
-      return true;
     } catch (err) {
       this.logCardStage('warn', 'final-update', this.formatError(err), {
         chatId,
         cardId: state.cardId,
         sequence: state.sequence,
         status,
+      });
+      return false;
+    }
+
+    try {
+      // Step 2: Close streaming mode after the final refresh is visible.
+      state.sequence++;
+      this.logCardStage('log', 'close-stream', 'closing streaming mode', {
+        chatId,
+        cardId: state.cardId,
+        sequence: state.sequence,
+      });
+      await cardkit.card.settings({
+        path: { card_id: state.cardId },
+        data: buildCardSettingsData({ streaming_mode: false }, state.sequence),
+      });
+      return true;
+    } catch (err) {
+      this.logCardStage('warn', 'close-stream', this.formatError(err), {
+        chatId,
+        cardId: state.cardId,
+        sequence: state.sequence,
       });
       return false;
     } finally {
@@ -1000,6 +1067,97 @@ export class FeishuAdapter extends BaseChannelAdapter {
       return this.sendAsCard(message.address.chatId, text);
     }
     return this.sendAsPost(message.address.chatId, text);
+  }
+
+  async sendFileBrowserCard(
+    chatId: string,
+    currentPath: string,
+    entries: FeishuFileBrowserEntry[],
+    notice?: string,
+  ): Promise<SendResult> {
+    if (!this.restClient) {
+      return { ok: false, error: 'Feishu client not initialized' };
+    }
+
+    const cardContent = buildFileBrowserCard(currentPath, entries, chatId, notice);
+    try {
+      const res = await this.restClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'interactive',
+          content: cardContent,
+        },
+      });
+      if (res?.data?.message_id) {
+        return { ok: true, messageId: res.data.message_id };
+      }
+      return { ok: false, error: res?.msg || 'Send failed' };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
+    }
+  }
+
+  async sendLocalFile(chatId: string, absolutePath: string): Promise<SendResult> {
+    if (!this.restClient) {
+      return { ok: false, error: 'Feishu client not initialized' };
+    }
+
+    try {
+      const stat = fs.statSync(absolutePath);
+      if (!stat.isFile()) {
+        return { ok: false, error: 'Path is not a file' };
+      }
+      if (stat.size <= 0) {
+        return { ok: false, error: 'File is empty' };
+      }
+      if (stat.size > MAX_UPLOAD_FILE_SIZE) {
+        return { ok: false, error: `File exceeds ${MAX_UPLOAD_FILE_SIZE} bytes` };
+      }
+
+      const fileName = path.basename(absolutePath);
+      const ext = path.extname(fileName).toLowerCase();
+      const fileType = ext === '.pdf'
+        ? 'pdf'
+        : ext === '.doc' || ext === '.docx'
+          ? 'doc'
+          : ext === '.xls' || ext === '.xlsx' || ext === '.csv'
+            ? 'xls'
+            : ext === '.ppt' || ext === '.pptx'
+              ? 'ppt'
+              : ext === '.mp4'
+                ? 'mp4'
+                : ext === '.opus'
+                  ? 'opus'
+                  : 'stream';
+
+      const uploadResp = await this.restClient.im.file.create({
+        data: {
+          file_type: fileType,
+          file_name: fileName,
+          file: fs.readFileSync(absolutePath),
+        },
+      });
+      const fileKey = uploadResp?.file_key;
+      if (!fileKey) {
+        return { ok: false, error: 'File upload failed' };
+      }
+
+      const sendResp = await this.restClient.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: {
+          receive_id: chatId,
+          msg_type: 'file',
+          content: JSON.stringify({ file_key: fileKey }),
+        },
+      });
+      if (sendResp?.data?.message_id) {
+        return { ok: true, messageId: sendResp.data.message_id };
+      }
+      return { ok: false, error: sendResp?.msg || 'Send failed' };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : 'Send failed' };
+    }
   }
 
   /**
